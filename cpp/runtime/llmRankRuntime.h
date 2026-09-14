@@ -240,6 +240,9 @@ public:
     }
 
 private:
+    friend class ContinuousBatchingProbe;
+    friend class SequenceStepRuntime;
+
     void initializeFromEngineDir(std::string const& engineDir, std::string const& multimodalEngineDir,
         std::unordered_map<std::string, std::string> const& loraWeightsMap,
         std::optional<SpecDecodeDraftingConfig> const& draftingConfig, cudaStream_t stream,
