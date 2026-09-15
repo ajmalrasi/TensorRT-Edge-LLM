@@ -33,9 +33,9 @@
 #include "profiling/metrics.h"
 #include "runtime/audioLoader.h"
 #include "runtime/audioUtils.h"
+#include "runtime/continuousScheduler.h"
 #include "runtime/imageUtils.h"
 #include "runtime/llmInferenceRuntime.h"
-#include "runtime/continuousScheduler.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/melSpectrogram.h"
 #ifdef EDGELLM_ENABLE_NEMOTRON_ASR
@@ -275,10 +275,10 @@ public:
         return response;
     }
 
-    void enableContinuousBatching(size_t maxQueued, size_t maxQueuedBytes)
+    void enableContinuousBatching(size_t maxQueued, size_t maxQueuedBytes, bool captureGraphs)
     {
         ELLM_CHECK(mScheduler == nullptr, "Continuous scheduler is already enabled");
-        mScheduler = mRuntime->createContinuousScheduler(mStream.get(), maxQueued, maxQueuedBytes);
+        mScheduler = mRuntime->createContinuousScheduler(mStream.get(), maxQueued, maxQueuedBytes, captureGraphs);
     }
 
     std::vector<int32_t> prepareContinuousPrompt(LLMGenerationRequest const& request) const
@@ -296,6 +296,11 @@ public:
     py::bytes continuousTokenPiece(int32_t tokenId) const
     {
         return py::bytes(mRuntime->continuousTokenPiece(tokenId));
+    }
+
+    std::array<uint64_t, 4> continuousExecutionStats() const
+    {
+        return mRuntime->continuousExecutionStats();
     }
 
     bool continuousHealthy() const
@@ -1022,19 +1027,24 @@ PYBIND11_MODULE(_edgellm_runtime, m)
         .def_readwrite("generation", &SchedulerRequestOptions::generation)
         .def_readwrite("stream_records", &SchedulerRequestOptions::streamRecords)
         .def_readwrite("stream_bytes", &SchedulerRequestOptions::streamBytes)
-        .def("set_queue_timeout_ms", [](SchedulerRequestOptions& self, int64_t timeoutMs) {
-            self.queueDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{timeoutMs};
-        })
+        .def("set_queue_timeout_ms",
+            [](SchedulerRequestOptions& self, int64_t timeoutMs) {
+                self.queueDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{timeoutMs};
+            })
         .def("set_timeout_ms", [](SchedulerRequestOptions& self, int64_t timeoutMs) {
             self.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{timeoutMs};
         });
     py::class_<SchedulerTicket>(m, "ContinuousTicket")
         .def("id", &SchedulerTicket::id)
         .def("cancel", &SchedulerTicket::cancel)
-        .def("read", [](SchedulerTicket const& self, int64_t timeoutMs) {
-            return self.read(std::chrono::milliseconds{timeoutMs});
-        }, py::arg("timeout_ms"), py::call_guard<py::gil_scoped_release>())
-        .def("result", [](SchedulerTicket const& self) { return self.result().get(); },
+        .def(
+            "read",
+            [](SchedulerTicket const& self, int64_t timeoutMs) {
+                return self.read(std::chrono::milliseconds{timeoutMs});
+            },
+            py::arg("timeout_ms"), py::call_guard<py::gil_scoped_release>())
+        .def(
+            "result", [](SchedulerTicket const& self) { return self.result().get(); },
             py::call_guard<py::gil_scoped_release>());
 
     // ========================================================================
@@ -1056,14 +1066,15 @@ PYBIND11_MODULE(_edgellm_runtime, m)
             py::arg("dflash_block_size") = 0, "Construct for speculative decoding")
         .def("handle_request", &PyLLMRuntime::handleRequest, py::arg("request"),
             py::call_guard<py::gil_scoped_release>(), "Process a generation request and return the response")
-        .def("enable_continuous_batching", &PyLLMRuntime::enableContinuousBatching,
-            py::arg("max_queued") = 8, py::arg("max_queued_bytes") = 256 * 1024,
+        .def("enable_continuous_batching", &PyLLMRuntime::enableContinuousBatching, py::arg("max_queued") = 8,
+            py::arg("max_queued_bytes") = 256 * 1024, py::arg("capture_graphs") = false,
             py::call_guard<py::gil_scoped_release>())
         .def("prepare_continuous_prompt", &PyLLMRuntime::prepareContinuousPrompt, py::arg("request"),
             py::call_guard<py::gil_scoped_release>())
         .def("submit_continuous", &PyLLMRuntime::submitContinuous, py::arg("prompt"), py::arg("options"),
             py::call_guard<py::gil_scoped_release>())
         .def("continuous_token_piece", &PyLLMRuntime::continuousTokenPiece, py::arg("token_id"))
+        .def("continuous_execution_stats", &PyLLMRuntime::continuousExecutionStats)
         .def("continuous_healthy", &PyLLMRuntime::continuousHealthy)
         .def("continuous_queued_requests", &PyLLMRuntime::continuousQueuedRequests)
         .def("continuous_resident_requests", &PyLLMRuntime::continuousResidentRequests)

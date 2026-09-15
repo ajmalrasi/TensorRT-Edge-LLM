@@ -488,7 +488,7 @@ namespace trt_edgellm
 namespace rt
 {
 //! Validate the production step interfaces against the independent P1/legacy path.
-bool runStepTests(LLMRankRuntime& runtime, tokenizer::Tokenizer& tokenizer, cudaStream_t stream)
+bool runStepTests(LLMRankRuntime& runtime, tokenizer::Tokenizer& tokenizer, cudaStream_t stream, bool graphs = false)
 {
     auto const words = tokenizer.encode("A red fox crosses a blue river. One two three four. ");
     require(!words.empty(), "Missing fixture tokens");
@@ -522,7 +522,7 @@ bool runStepTests(LLMRankRuntime& runtime, tokenizer::Tokenizer& tokenizer, cuda
     {
         ContinuousBatchingProbe observer(runtime, stream);
         auto const samplerBefore = observer.samplingBytes();
-        SequenceStepRuntime steps(runtime, stream);
+        SequenceStepRuntime steps(runtime, stream, graphs);
         auto rejects = [&](auto operation, char const* label) {
             bool rejected = false;
             try
@@ -643,6 +643,13 @@ bool runStepTests(LLMRankRuntime& runtime, tokenizer::Tokenizer& tokenizer, cuda
         response.outputIds.size() == 1 && response.outputIds[0] == std::vector<int32_t>{greedy(firstA), greedy(nextA)},
         "Legacy output changed after releasing the step lease");
     std::cout << "LEGACY_RESTORED passed=1" << std::endl;
+    if (graphs)
+    {
+        auto const stats = runtime.executionStats();
+        passed = passed && stats.captures == 3 && stats.replays >= 4;
+        std::cout << "P7_GRAPH_GATE passed=" << passed << " captures=" << stats.captures << " replays=" << stats.replays
+                  << " eager=" << stats.eager << " profile_switches=" << stats.profileSwitches << std::endl;
+    }
     std::cout << "P2_STATE_GATE passed=" << passed << " full_chunk_quality=separate_P1_TAIL_BASELINE" << std::endl;
     return passed;
 }
@@ -1220,11 +1227,11 @@ int main(int argc, char** argv)
     if (argc != 3
         && (argc != 4
             || (std::string(argv[3]) != "--policies" && std::string(argv[3]) != "--scheduler"
-                && std::string(argv[3]) != "--steps"
+                && std::string(argv[3]) != "--steps" && std::string(argv[3]) != "--graphs"
                 && (std::string(argv[3]) != "--chunks" && std::string(argv[3]) != "--chunks-extra"))))
     {
         std::cerr << "Usage: continuous_batching_probe ENGINE_DIR CHECKPOINT_DIR "
-                     "[--steps|--chunks|--chunks-extra|--scheduler|--policies]\n";
+                     "[--steps|--graphs|--chunks|--chunks-extra|--scheduler|--policies]\n";
         return 2;
     }
     cudaStream_t stream{};
@@ -1243,11 +1250,12 @@ int main(int argc, char** argv)
                 ? trt_edgellm::rt::runPolicyTests(runtime, tokenizer, stream)
                 : argc == 4 && std::string(argv[3]) == "--scheduler"
                 ? trt_edgellm::rt::runSchedulerTests(runtime, tokenizer, stream)
-                : argc == 4 ? (std::string(argv[3]).find("--chunks") == 0
-                                      ? trt_edgellm::rt::runChunkTests(
-                                            runtime, tokenizer, stream, std::string(argv[3]) == "--chunks-extra")
-                                      : trt_edgellm::rt::runStepTests(runtime, tokenizer, stream))
-                            : trt_edgellm::rt::runProbe(runtime, tokenizer, stream);
+                : argc == 4
+                ? (std::string(argv[3]).find("--chunks") == 0 ? trt_edgellm::rt::runChunkTests(runtime, tokenizer,
+                                                                    stream, std::string(argv[3]) == "--chunks-extra")
+                                                              : trt_edgellm::rt::runStepTests(runtime, tokenizer,
+                                                                    stream, std::string(argv[3]) == "--graphs"))
+                : trt_edgellm::rt::runProbe(runtime, tokenizer, stream);
         }
         CUDA_CHECK(cudaStreamDestroy(stream));
         std::cout << "PROBE_RESULT passed=" << passed << std::endl;

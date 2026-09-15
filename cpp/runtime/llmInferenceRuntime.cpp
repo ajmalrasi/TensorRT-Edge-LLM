@@ -19,8 +19,8 @@
 
 #include "common/checkMacros.h"
 #include "common/logger.h"
-#include "runtime/llmRankRuntime.h"
 #include "runtime/greedySchedulerBackend.h"
+#include "runtime/llmRankRuntime.h"
 #include "runtime/multiDevice/runtimeCoordinator.h"
 
 #include <exception>
@@ -233,19 +233,25 @@ std::vector<std::vector<int32_t>> const& LLMInferenceRuntime::getBaseModelInputT
     return rootRuntime().getBaseModelInputTokenIds();
 }
 
+std::array<uint64_t, 4> LLMInferenceRuntime::continuousExecutionStats() const
+{
+    auto const stats = rootRuntime().executionStats();
+    return {stats.captures, stats.replays, stats.eager, stats.profileSwitches};
+}
+
 bool LLMInferenceRuntime::hasDraftModel() const
 {
     return rootRuntime().hasDraftModel();
 }
 
 std::unique_ptr<ContinuousScheduler> LLMInferenceRuntime::createContinuousScheduler(
-    cudaStream_t stream, size_t maxQueued, size_t maxQueuedBytes)
+    cudaStream_t stream, size_t maxQueued, size_t maxQueuedBytes, bool captureGraphs)
 {
     ELLM_CHECK(mCoordinator != nullptr, "Runtime coordinator is not initialized.");
     ELLM_CHECK(!hasDraftModel(), "Continuous scheduling does not support speculative decoding.");
     auto& runtime = rootRuntime();
     auto backend = std::make_unique<SamplingSchedulerBackend>(
-        runtime, stream, runtime.vocabularySize(), &runtime.tokenizer());
+        runtime, stream, runtime.vocabularySize(), &runtime.tokenizer(), captureGraphs);
     return std::make_unique<ContinuousScheduler>(std::move(backend), maxQueued, maxQueuedBytes);
 }
 

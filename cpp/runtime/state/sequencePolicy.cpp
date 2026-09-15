@@ -80,8 +80,12 @@ SequenceSample SequenceSampler::sample(float const* logits, SequenceOptions cons
     }
     auto better
         = [](Entry const& a, Entry const& b) { return a.logit > b.logit || (a.logit == b.logit && a.token < b.token); };
-    // std::sort uses stack storage; stable_sort may allocate on every token.
-    std::sort(mEntries.begin(), mEntries.end(), better);
+    bool const greedy = o.temperature <= 1e-3F || o.topK == 1
+        || (o.topK <= 1 && o.topP >= 1.0F - 1e-6F && std::fabs(o.temperature - 1.0F) <= 1e-3F);
+    // Logprob requests retain the original summation order for exact policy compatibility.
+    size_t const needed
+        = o.numLogprobs > 0 || (!greedy && o.topK == 0) ? mEntries.size() : (greedy ? 1 : static_cast<size_t>(o.topK));
+    std::partial_sort(mEntries.begin(), mEntries.begin() + needed, mEntries.end(), better);
     double const maximum = mEntries.front().logit;
     double normalizer = 0;
     for (auto const& entry : mEntries)
@@ -97,8 +101,6 @@ SequenceSample SequenceSampler::sample(float const* logits, SequenceOptions cons
         out.top[i] = {mEntries[i].token, mEntries[i].logit - logNormalizer};
     }
     size_t selected = 0;
-    bool const greedy = o.temperature <= 1e-3F || o.topK == 1
-        || (o.topK <= 1 && o.topP >= 1.0F - 1e-6F && std::fabs(o.temperature - 1.0F) <= 1e-3F);
     if (!greedy)
     {
         if (counter == std::numeric_limits<uint64_t>::max())

@@ -53,7 +53,7 @@ struct SequenceStepRuntime::View
     std::map<std::string, Tensor> rows;
 };
 
-SequenceStepRuntime::SequenceStepRuntime(LLMRankRuntime& runtime, cudaStream_t stream)
+SequenceStepRuntime::SequenceStepRuntime(LLMRankRuntime& runtime, cudaStream_t stream, bool captureGraphs)
     : mRuntime(runtime)
     , mStream(stream)
     , mLease(std::make_unique<Lease>(runtime.mHandleRequestInProgress))
@@ -103,6 +103,63 @@ SequenceStepRuntime::SequenceStepRuntime(LLMRankRuntime& runtime, cudaStream_t s
         mViews[index] = std::move(view);
     }
     CUDA_CHECK(cudaEventCreateWithFlags(&mComplete, cudaEventDisableTiming));
+    if (captureGraphs)
+    {
+        try
+        {
+            captureDecodeViews();
+        }
+        catch (...)
+        {
+            mLease->poisoned = true;
+            cudaStreamSynchronize(mStream);
+            cudaEventDestroy(mComplete);
+            mComplete = nullptr;
+            throw;
+        }
+    }
+}
+
+void SequenceStepRuntime::captureDecodeViews()
+{
+    // Capture warmups mutate hybrid state; only disposable startup sequences may own it here.
+    SequenceOptions options;
+    options.maxOutputTokens = 2;
+    auto first = acquire(1, {0}, options);
+    auto second = acquire(2, {0}, options);
+    for (auto handle : {first, second})
+    {
+        beginPrefillChunk(handle);
+        completeStep();
+        acceptToken(handle, 0);
+        beginDecode({handle, {}}, 1);
+        completeStep();
+        require(mRuntime.mBaseExecutor->captureGraph(mStream), "Selected-slot graph capture failed");
+        acceptToken(handle, 0);
+    }
+    // Recreate logical inputs while retaining the same physical addresses for the paired view.
+    finish(first);
+    finish(second);
+    release(first);
+    release(second);
+    first = acquire(3, {0}, options);
+    second = acquire(4, {0}, options);
+    for (auto handle : {first, second})
+    {
+        beginPrefillChunk(handle);
+        completeStep();
+        acceptToken(handle, 0);
+    }
+    beginDecode({first, second}, 2);
+    completeStep();
+    require(mRuntime.mBaseExecutor->captureGraph(mStream), "Paired graph capture failed");
+    CUDA_CHECK(cudaStreamSynchronize(mStream));
+    finish(first);
+    finish(second);
+    release(first);
+    release(second);
+    mRuntime.zeroRecurrentStates(0, mStream);
+    mRuntime.zeroRecurrentStates(1, mStream);
 }
 
 SequenceStepRuntime::~SequenceStepRuntime()

@@ -21,7 +21,7 @@ class LLMRankRuntime;
 class SequenceStepRuntime
 {
 public:
-    SequenceStepRuntime(LLMRankRuntime& runtime, cudaStream_t stream);
+    SequenceStepRuntime(LLMRankRuntime& runtime, cudaStream_t stream, bool captureGraphs = false);
     ~SequenceStepRuntime();
     SequenceStepRuntime(SequenceStepRuntime const&) = delete;
     SequenceStepRuntime& operator=(SequenceStepRuntime const&) = delete;
@@ -48,6 +48,7 @@ private:
     struct Lease;
     struct View;
     void requireIdle() const;
+    void captureDecodeViews();
     Tensor const& enqueue(std::array<SequenceHandle, 2> const& handles, int32_t count, int32_t span, bool decode);
     LLMRankRuntime& mRuntime;
     cudaStream_t mStream;

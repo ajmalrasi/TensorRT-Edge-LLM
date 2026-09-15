@@ -11,9 +11,9 @@ namespace trt_edgellm
 {
 namespace rt
 {
-SamplingSchedulerBackend::SamplingSchedulerBackend(
-    LLMRankRuntime& runtime, cudaStream_t stream, int32_t vocabularySize, tokenizer::Tokenizer const* tokenizer)
-    : mSteps(runtime, stream)
+SamplingSchedulerBackend::SamplingSchedulerBackend(LLMRankRuntime& runtime, cudaStream_t stream, int32_t vocabularySize,
+    tokenizer::Tokenizer const* tokenizer, bool captureGraphs)
+    : mSteps(runtime, stream, captureGraphs)
     , mStream(stream)
     , mVocabulary(vocabularySize)
     , mHostLogits({2, vocabularySize}, DeviceType::kCPU, nvinfer1::DataType::kFLOAT)

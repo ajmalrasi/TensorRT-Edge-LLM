@@ -286,6 +286,13 @@ class EngineClient:
         return self._capabilities
 
     @property
+    def execution_stats(self) -> Dict[str, int]:
+        if getattr(self._llm, "continuous_batching_enabled", False):
+            values = self._llm._runtime.continuous_execution_stats()
+            return dict(zip(("captures", "replays", "eager", "profile_switches"), values))
+        return {}
+
+    @property
     def healthy(self) -> bool:
         if self._closed:
             return False

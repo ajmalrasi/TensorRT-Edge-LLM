@@ -859,12 +859,16 @@ class LLM:
         if self._continuous_batching:
             return
         if self.has_draft_model or self._max_batch_size < 2:
-            raise ValueError("continuous batching requires a vanilla batch-two engine")
+            raise ValueError(
+                "continuous batching requires a vanilla batch-two engine")
         if self._layout.visual_dir or self._layout.audio_dir:
-            raise ValueError("continuous batching currently supports text-only engines")
+            raise ValueError(
+                "continuous batching currently supports text-only engines")
         if self._context_cache_config.enabled:
-            raise ValueError("continuous batching does not support context cache")
-        self._runtime.enable_continuous_batching()
+            raise ValueError(
+                "continuous batching does not support context cache")
+        self._runtime.enable_continuous_batching(capture_graphs=os.environ.get(
+            "EDGELLM_CONTINUOUS_GRAPHS", "0") == "1")
         self._continuous_batching = True
 
     def _continuous_options(self, params: SamplingParams, *, stream: bool):
@@ -880,11 +884,13 @@ class LLM:
         generation.stop_strings = params.stop
         generation.logit_bias = _normalize_logit_bias(params.logit_bias)
         options.generation = generation
-        options.stream_records = min(max(params.max_tokens + 2, 2), 64) if stream else 0
+        options.stream_records = min(max(params.max_tokens +
+                                         2, 2), 64) if stream else 0
         options.stream_bytes = 65536 if stream else 0
         return options
 
-    def _submit_continuous(self, request, params: SamplingParams, *, stream: bool):
+    def _submit_continuous(self, request, params: SamplingParams, *,
+                           stream: bool):
         self._ensure_open()
         prompt = self._runtime.prepare_continuous_prompt(request)
         return self._runtime.submit_continuous(
@@ -896,40 +902,58 @@ class LLM:
             entries = []
             for entry in list(sample.top)[:sample.top_count]:
                 piece = self._runtime.continuous_token_piece(entry.token)
-                entries.append(LogprobEntry(entry.token, entry.logprob,
-                                            piece.decode("utf-8", "replace"),
-                                            list(piece)))
+                entries.append(
+                    LogprobEntry(entry.token, entry.logprob,
+                                 piece.decode("utf-8", "replace"),
+                                 list(piece)))
             if not any(entry.token_id == sample.token for entry in entries):
                 piece = self._runtime.continuous_token_piece(sample.token)
-                entries.append(LogprobEntry(sample.token, sample.logprob,
-                                            piece.decode("utf-8", "replace"),
-                                            list(piece), chosen_only=True))
+                entries.append(
+                    LogprobEntry(sample.token,
+                                 sample.logprob,
+                                 piece.decode("utf-8", "replace"),
+                                 list(piece),
+                                 chosen_only=True))
             converted.append(entries)
         return converted
 
-    def _complete_continuous_request(self, request, params: SamplingParams,
-                                     tool_config: ToolConfig, *, tool_parser: str,
-                                     reasoning_parser: str, ticket=None) -> CompletionOutput:
+    def _complete_continuous_request(self,
+                                     request,
+                                     params: SamplingParams,
+                                     tool_config: ToolConfig,
+                                     *,
+                                     tool_parser: str,
+                                     reasoning_parser: str,
+                                     ticket=None) -> CompletionOutput:
         if ticket is None:
             ticket = self._submit_continuous(request, params, stream=False)
         result = ticket.result()
         if result.status == self._rt.SchedulerStatus.DEADLINE:
             raise ServerOverloadedError("native request deadline expired")
         if result.status != self._rt.SchedulerStatus.COMPLETED:
-            raise RuntimeError(f"continuous generation failed: {result.status}")
+            raise RuntimeError(
+                f"continuous generation failed: {result.status}")
         finish_reason = {
             self._rt.SequenceFinish.LENGTH: "length",
             self._rt.SequenceFinish.EOS: "stop",
             self._rt.SequenceFinish.STOP: "stop",
         }.get(result.finish, "stop")
         output = self._parse_generation_output(
-            result.text, list(result.tokens), result.prompt_tokens, finish_reason, tool_config,
-            tool_parser=tool_parser, reasoning_parser=reasoning_parser)
+            result.text,
+            list(result.tokens),
+            result.prompt_tokens,
+            finish_reason,
+            tool_config,
+            tool_parser=tool_parser,
+            reasoning_parser=reasoning_parser)
         if params.num_logprobs:
             output.logprobs = self._continuous_logprobs(result.logprobs)
         return output
 
-    def generate_continuous_stream(self, request, params: SamplingParams, ticket=None) -> Iterator[StreamDelta]:
+    def generate_continuous_stream(self,
+                                   request,
+                                   params: SamplingParams,
+                                   ticket=None) -> Iterator[StreamDelta]:
         """Read one P5 ticket channel; closing this iterator cancels only it."""
         state = {"ticket": ticket}
 
@@ -949,23 +973,29 @@ class LLM:
                     read = ticket.read(timeout_ms=200)
                     if read.update is not None:
                         update = read.update
-                        yield StreamDelta(text=update.text,
-                                          token_ids=([update.sample.token] if update.sample.token >= 0 else []),
-                                          logprobs=(self._continuous_logprobs([update.sample])
-                                                    if params.num_logprobs and update.sample.token >= 0 else []))
+                        yield StreamDelta(
+                            text=update.text,
+                            token_ids=([update.sample.token]
+                                       if update.sample.token >= 0 else []),
+                            logprobs=(self._continuous_logprobs(
+                                [update.sample]) if params.num_logprobs
+                                      and update.sample.token >= 0 else []))
                     if read.closed:
                         terminal = ticket.result()
                         if terminal.status == self._rt.SchedulerStatus.DEADLINE:
-                            raise ServerOverloadedError("native request deadline expired")
+                            raise ServerOverloadedError(
+                                "native request deadline expired")
                         if terminal.status != self._rt.SchedulerStatus.COMPLETED:
                             raise RuntimeError(
-                                f"continuous generation failed: {terminal.status}")
+                                f"continuous generation failed: {terminal.status}"
+                            )
                         reason = {
                             self._rt.SequenceFinish.LENGTH: "length",
                             self._rt.SequenceFinish.EOS: "stop",
                             self._rt.SequenceFinish.STOP: "stop",
                         }.get(terminal.finish, "stop")
-                        yield StreamDelta(finished=True, finish_reason=reason,
+                        yield StreamDelta(finished=True,
+                                          finish_reason=reason,
                                           prompt_tokens=terminal.prompt_tokens)
                         return
             finally:

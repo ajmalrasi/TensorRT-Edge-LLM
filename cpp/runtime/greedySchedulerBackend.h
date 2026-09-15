@@ -18,7 +18,7 @@ class SamplingSchedulerBackend : public SchedulerBackend
 {
 public:
     SamplingSchedulerBackend(LLMRankRuntime& runtime, cudaStream_t stream, int32_t vocabularySize,
-        tokenizer::Tokenizer const* tokenizer = nullptr);
+        tokenizer::Tokenizer const* tokenizer = nullptr, bool captureGraphs = false);
     void start() override;
     void invalidate() noexcept override
     {

@@ -50,6 +50,7 @@ async def health(request: Request):
     return {
         "status": "healthy",
         "model": client.model_name,
+        "execution": client.execution_stats,
         "active_requests": client.active_requests,
         "queued_requests": client.queued_requests,
         "capabilities": {

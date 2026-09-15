@@ -246,6 +246,11 @@ public:
         ELLM_CHECK(mTokenizer != nullptr, "LLMRankRuntime tokenizer is not initialized.");
         return *mTokenizer;
     }
+    auto executionStats() const noexcept
+    {
+        return mBaseExecutor->executionStats();
+    }
+
     int32_t vocabularySize() const
     {
         return mDeployment.base.vocabSize;
