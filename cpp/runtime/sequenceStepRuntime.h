@@ -30,7 +30,10 @@ public:
     SequenceState const& state(SequenceHandle handle) const;
     //! Enqueue a prompt span or pending output tokens. No sampling, output publication or CPU state commit occurs.
     //! Logits are borrowed until the next begin call; they become readable after completion on the supplied stream.
+    //! Low-level span control for diagnostics; arbitrary partitions are not numerically qualified.
     Tensor const& beginPrefill(SequenceHandle handle, int32_t count);
+    //! Enqueue at most 128 true prompt tokens; completeStep publishes progress. Sample only at kAwaitingSample.
+    Tensor const& beginPrefillChunk(SequenceHandle handle);
     Tensor const& beginDecode(std::array<SequenceHandle, 2> const& handles, int32_t count);
     //! Wait for forward completion before publishing endpoints and reusing pinned staging or physical slots.
     void completeStep();

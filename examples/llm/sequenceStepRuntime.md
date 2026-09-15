@@ -80,3 +80,10 @@ The `P2_STATE_GATE` line reports mechanism correctness. The retained
 `P1_TAIL_BASELINE quality_passed=0` is a **failing** numerical diagnostic, even
 when P2 succeeds. P3 must resolve or rigorously qualify it before production
 chunking can be considered complete. No threshold was relaxed.
+
+## Bounded prompt continuation
+
+P3 adds `beginPrefillChunk(handle)` for a fixed 128-token cap with numerically
+qualified tail partitioning. Use it from the first prompt step; low-level manual
+partitions remain diagnostic. See [chunked prefill](chunkedPrefill.md) for the
+shape restriction, final-sample accounting and retained failing controls.

@@ -7,6 +7,7 @@
 #include "kernels/embeddingKernels/embeddingKernels.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
 #include "runtime/llmRankRuntime.h"
+#include "runtime/state/prefillChunk.h"
 
 #include <algorithm>
 #include <map>
@@ -161,6 +162,16 @@ Tensor const& SequenceStepRuntime::beginPrefill(SequenceHandle handle, int32_t c
             && count <= static_cast<int32_t>(sequence.prompt().size()) - sequence.promptCursor(),
         "Invalid prefill span");
     return enqueue({handle, {}}, 1, count, false);
+}
+
+Tensor const& SequenceStepRuntime::beginPrefillChunk(SequenceHandle handle)
+{
+    requireIdle();
+    auto const& sequence = state(handle);
+    int32_t const remaining = static_cast<int32_t>(sequence.prompt().size()) - sequence.promptCursor();
+    require(sequence.promptCursor() % 64 == 0 && (sequence.promptCursor() == 0 || remaining >= 64),
+        "Chunk policy cannot continue an incompatible manually partitioned prompt");
+    return beginPrefill(handle, nextPrefillChunkSize(remaining));
 }
 
 Tensor const& SequenceStepRuntime::beginDecode(std::array<SequenceHandle, 2> const& handles, int32_t count)

@@ -247,6 +247,73 @@ public:
         std::cout << "ISOLATION slot=" << mSnapshotSlot << " exact_bytes=" << totalBytes << " passed=1" << std::endl;
     }
 
+    int32_t vocabularySize() const
+    {
+        return mRuntime.mDeployment.base.outputVocabSize;
+    }
+
+    //! Compare live physical rows without allocating another state-sized snapshot.
+    bool compareActive(std::string const& label, int32_t length)
+    {
+        Tensor candidate({kCOPY_BYTES}, DeviceType::kCPU, nvinfer1::DataType::kUINT8);
+        bool passed = true;
+        auto check = [&](Tensor& tensor, size_t rowBytes, size_t planeOffset, size_t bytes, std::string const& name) {
+            double squaredError = 0.0, squaredReference = 0.0;
+            double maxError = 0.0;
+            bool finite = true;
+            size_t const elementBytes
+                = tensor.getDataType() == nvinfer1::DataType::kFLOAT ? sizeof(float) : sizeof(half);
+            for (size_t offset = 0; offset < bytes; offset += kCOPY_BYTES)
+            {
+                size_t const count = std::min(static_cast<size_t>(kCOPY_BYTES), bytes - offset);
+                auto* source = static_cast<std::byte*>(tensor.rawPointer()) + planeOffset + offset;
+                CUDA_CHECK(cudaMemcpyAsync(mScratch.rawPointer(), source, count, cudaMemcpyDeviceToHost, mStream));
+                CUDA_CHECK(
+                    cudaMemcpyAsync(candidate.rawPointer(), source + rowBytes, count, cudaMemcpyDeviceToHost, mStream));
+                CUDA_CHECK(cudaStreamSynchronize(mStream));
+                for (size_t i = 0; i < count / elementBytes; ++i)
+                {
+                    double const a = elementBytes == sizeof(float) ? mScratch.dataPointer<float>()[i]
+                                                                   : __half2float(mScratch.dataPointer<half>()[i]);
+                    double const b = elementBytes == sizeof(float) ? candidate.dataPointer<float>()[i]
+                                                                   : __half2float(candidate.dataPointer<half>()[i]);
+                    finite = finite && std::isfinite(a) && std::isfinite(b);
+                    maxError = std::max(maxError, std::abs(a - b));
+                    squaredError += (a - b) * (a - b);
+                    squaredReference += a * a;
+                }
+            }
+            double const relative = std::sqrt(squaredError / std::max(squaredReference, 1.0e-30));
+            bool const ok = finite && maxError <= 0.1 && relative <= 0.005;
+            passed = ok && passed;
+            std::cout << "ACTIVE_STATE " << label << " " << name << " max_abs=" << maxError
+                      << " relative_l2=" << relative << " finite=" << finite << " passed=" << ok << std::endl;
+        };
+        auto& mamba = cache().getMambaCacheManager();
+        for (int32_t layer = 0; layer < mamba.numLayers(); ++layer)
+        {
+            auto& recurrent = mamba.getRecurrentState(layer);
+            auto& conv = mamba.getConvState(layer);
+            check(recurrent, recurrent.getMemoryCapacity() / 2, 0, recurrent.getMemoryCapacity() / 2,
+                "recurrent_" + std::to_string(layer));
+            check(conv, conv.getMemoryCapacity() / 2, 0, conv.getMemoryCapacity() / 2, "conv_" + std::to_string(layer));
+        }
+        auto& kv = cache().getKVCacheManager();
+        for (int32_t layer = 0; layer < kv.numLayers(); ++layer)
+        {
+            auto& tensor = kv.getCombinedKVCache(layer);
+            auto const shape = tensor.getShape();
+            size_t const tokenBytes = shape[3] * shape[4] * sizeof(half);
+            size_t const planeBytes = tensor.getMemoryCapacity() / 2;
+            for (int32_t plane = 0; plane < 2; ++plane)
+            {
+                check(tensor, planeBytes / 2, plane * planeBytes, length * tokenBytes,
+                    "kv_" + std::to_string(layer) + "_" + std::to_string(plane));
+            }
+        }
+        return passed;
+    }
+
     //! Record device allocator availability, not process RSS or exclusive GPU use.
     void memory(std::string const& label)
     {
@@ -578,14 +645,256 @@ bool runStepTests(LLMRankRuntime& runtime, tokenizer::Tokenizer& tokenizer, cuda
     std::cout << "P2_STATE_GATE passed=" << passed << " full_chunk_quality=separate_P1_TAIL_BASELINE" << std::endl;
     return passed;
 }
+
+//! Full-prompt numerical screen, separate from the matching-recipe P2 mechanism gate.
+bool runChunkTests(LLMRankRuntime& runtime, tokenizer::Tokenizer& tokenizer, cudaStream_t stream, bool extended)
+{
+    auto const words = tokenizer.encode("A red fox crosses a blue river. One two three four. ");
+    require(!words.empty(), "Missing fixture tokens");
+    ContinuousBatchingProbe observer(runtime, stream);
+    SequenceStepRuntime steps(runtime, stream);
+    Tensor host({2, observer.vocabularySize()}, DeviceType::kCPU, nvinfer1::DataType::kFLOAT);
+    auto finish = [&](Tensor const& logits) {
+        steps.completeStep();
+        size_t const count = logits.getShape().volume();
+        require(static_cast<size_t>(host.getMemoryCapacity()) >= count * sizeof(float), "Host logit capacity");
+        CUDA_CHECK(cudaMemcpyAsync(
+            host.rawPointer(), logits.rawPointer(), count * sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        return std::vector<float>(host.dataPointer<float>(), host.dataPointer<float>() + logits.getShape()[1]);
+    };
+    SequenceOptions options;
+    options.maxOutputTokens = 12;
+    bool passed = true;
+    uint64_t id = 0;
+    std::vector<std::pair<std::string, std::vector<int32_t>>> fixtures;
+    auto lengths = extended
+        ? std::vector<int32_t>{130, 131, 132, 191, 192, 193, 258, 259, 260, 319, 320, 321}
+        : std::vector<int32_t>{1, 3, 4, 63, 64, 65, 127, 128, 129, 255, 256, 257, 513, 1025, 2049, 6144};
+    if (extended)
+    {
+        for (int32_t length = 129; length <= 193; ++length)
+        {
+            if (std::find(lengths.begin(), lengths.end(), length) == lengths.end())
+            {
+                lengths.push_back(length);
+            }
+        }
+    }
+    for (int32_t length : lengths)
+    {
+        std::vector<int32_t> prompt;
+        for (int32_t i = 0; i < length; ++i)
+        {
+            prompt.push_back(words[i % words.size()]);
+        }
+        fixtures.emplace_back("policy_" + std::to_string(length), std::move(prompt));
+    }
+    if (extended)
+    {
+        std::string records;
+        for (int32_t i = 0; i < 100; ++i)
+        {
+            records += "Record " + std::to_string(i) + ": warehouse " + std::to_string(i % 7) + " has "
+                + std::to_string(17 * i + 3) + " blue items and " + std::to_string(11 * i + 5) + " red items.\n";
+        }
+        std::vector<std::string> texts{
+            "Explain why the Moon changes shape during a month. Use plain language and distinguish phases from "
+            "eclipses.",
+            "Write a Python function that merges two sorted lists. Explain empty inputs and duplicate values.\n"
+            "def merge(a, b):\n    # Preserve ordering and duplicates.\n    pass\n",
+            "Return JSON with fields city and greeting for Chennai, 東京, and Zürich. Preserve Unicode text. "
+            "The greeting in Tamil is வணக்கம். Do not invent population values.",
+            records + "Which warehouse appears in record 73, and how many blue items does that record contain?"};
+        for (size_t i = 0; i < texts.size(); ++i)
+        {
+            if (i < 3)
+            {
+                std::string const topic = texts[i];
+                for (int32_t repeat = 0; repeat < 4; ++repeat)
+                {
+                    texts[i] += "\nAdditional requested detail " + std::to_string(repeat) + ": " + topic;
+                }
+            }
+            LLMGenerationRequest::Request request;
+            request.messages.push_back({"system", {{"text", "You are a helpful assistant. Answer directly."}}});
+            request.messages.push_back({"user", {{"text", texts[i]}}});
+            LLMGenerationRequest::FormattedRequest formatted;
+            require(tokenizer.applyChatTemplate(request, formatted, true, true, false), "Chat formatting failed");
+            auto tokens = tokenizer.encode(formatted.formattedCompleteRequest);
+            require(!tokens.empty() && tokens.size() <= 6144, "Formatted fixture length");
+            fixtures.emplace_back("chat_" + std::to_string(i) + "_" + std::to_string(tokens.size()), std::move(tokens));
+        }
+    }
+    for (auto const& [label, prompt] : fixtures)
+    {
+        int32_t const length = static_cast<int32_t>(prompt.size());
+        auto a = steps.acquire(++id, prompt, options);
+        auto b = steps.acquire(++id, prompt, options);
+        auto reference = finish(steps.beginPrefill(a, length));
+        std::vector<float> actual;
+        int32_t chunks = 0;
+        while (steps.state(b).phase() == SequencePhase::kPrefill)
+        {
+            int32_t const before = steps.state(b).promptCursor();
+            actual = finish(steps.beginPrefillChunk(b));
+            int32_t const span = steps.state(b).promptCursor() - before;
+            require(span > 0 && span <= 128 && (before == 0 || span >= 64), "Invalid bounded partition");
+            require(steps.state(b).output().empty(), "Prefill emitted a completion");
+            ++chunks;
+        }
+        std::cout << "PARTITION " << label << " chunks=" << chunks << std::endl;
+        passed = compare(label, reference, actual, length <= 128) && passed;
+        passed = observer.compareActive(label, length) && passed;
+        int32_t const continuation = label.find("chat_") == 0 ? 8 : 4;
+        for (int32_t token = 0; token < continuation; ++token)
+        {
+            int32_t const teacher = greedy(reference);
+            steps.acceptToken(a, teacher);
+            steps.acceptToken(b, teacher);
+            reference = finish(steps.beginDecode({a, {}}, 1));
+            actual = finish(steps.beginDecode({b, {}}, 1));
+            passed = compare(label + "_teacher_" + std::to_string(token), reference, actual, length <= 128) && passed;
+        }
+        passed = observer.compareActive(label + "_after_teacher", length + continuation) && passed;
+        steps.release(a);
+        steps.release(b);
+    }
+    if (extended)
+    {
+        std::vector<int32_t> prompt(129);
+        for (size_t i = 0; i < prompt.size(); ++i)
+        {
+            prompt[i] = words[i % words.size()];
+        }
+        auto a = steps.acquire(++id, prompt, options);
+        auto b = steps.acquire(++id, prompt, options);
+        auto reference = finish(steps.beginPrefill(a, 129));
+        finish(steps.beginPrefill(b, 64));
+        finish(steps.beginPrefill(b, 64));
+        auto raw = finish(steps.beginPrefill(b, 1));
+        bool rawQuality = compare("raw_singleton_prefill", reference, raw);
+        rawQuality = observer.compareActive("raw_singleton_prefill", 129) && rawQuality;
+        steps.acceptToken(a, greedy(reference));
+        steps.acceptToken(b, greedy(reference));
+        reference = finish(steps.beginDecode({a, {}}, 1));
+        raw = finish(steps.beginDecode({b, {}}, 1));
+        rawQuality = compare("raw_singleton_teacher", reference, raw) && rawQuality;
+        rawQuality = observer.compareActive("raw_singleton_teacher", 130) && rawQuality;
+        std::cout << "RAW_TAIL_DIAGNOSTIC quality_passed=" << rawQuality << std::endl;
+        steps.release(a);
+        steps.release(b);
+
+        std::vector<int32_t> shortPrompt(prompt.begin(), prompt.begin() + 65);
+        std::vector<int32_t> longPrompt(513);
+        for (size_t i = 0; i < longPrompt.size(); ++i)
+        {
+            longPrompt[i] = words[(i + 3) % words.size()];
+        }
+        auto baseline = steps.acquire(++id, shortPrompt, options);
+        std::vector<std::vector<float>> referenceA{finish(steps.beginPrefill(baseline, 65))};
+        for (int32_t i = 0; i < 5; ++i)
+        {
+            steps.acceptToken(baseline, greedy(referenceA.back()));
+            referenceA.push_back(finish(steps.beginDecode({baseline, {}}, 1)));
+        }
+        steps.release(baseline);
+        baseline = steps.acquire(++id, longPrompt, options);
+        auto const referenceB = finish(steps.beginPrefill(baseline, 513));
+        steps.acceptToken(baseline, greedy(referenceB));
+        auto const nextB = finish(steps.beginDecode({baseline, {}}, 1));
+        steps.release(baseline);
+
+        auto incompatible = steps.acquire(++id, shortPrompt, options);
+        finish(steps.beginPrefill(incompatible, 64));
+        bool rejectedPolicy = false;
+        try
+        {
+            steps.beginPrefillChunk(incompatible);
+        }
+        catch (std::logic_error const&)
+        {
+            rejectedPolicy = true;
+        }
+        require(rejectedPolicy && steps.healthy(), "Policy accepted manually created singleton tail");
+        steps.release(incompatible);
+        std::cout << "REJECT mixed_manual_partition passed=1" << std::endl;
+        for (bool reversed : {false, true})
+        {
+            if (reversed)
+            {
+                b = steps.acquire(++id, longPrompt, options);
+                a = steps.acquire(++id, shortPrompt, options);
+            }
+            else
+            {
+                a = steps.acquire(++id, shortPrompt, options);
+                b = steps.acquire(++id, longPrompt, options);
+            }
+            std::cout << "INTERLEAVE decoding_slot=" << a.slot << " prefill_slot=" << b.slot << std::endl;
+            auto const scratch = observer.samplingBytes();
+            passed
+                = compare("interleaved_A_prefill", referenceA[0], finish(steps.beginPrefillChunk(a)), true) && passed;
+            steps.acceptToken(a, greedy(referenceA[0]));
+            int32_t index = 0;
+            while (steps.state(b).phase() == SequencePhase::kPrefill)
+            {
+                observer.observeEndpoint(a.slot, steps.state(a).committedTokens());
+                observer.snapshot(a.slot);
+                auto const chunk = finish(steps.beginPrefillChunk(b));
+                observer.verifySnapshot();
+                observer.observeEndpoint(b.slot, steps.state(b).committedTokens());
+                observer.snapshot(b.slot);
+                passed = compare("interleaved_A_decode_" + std::to_string(index), referenceA[index + 1],
+                             finish(steps.beginDecode({a, {}}, 1)), true)
+                    && passed;
+                observer.verifySnapshot();
+                ++index;
+                if (steps.state(b).phase() == SequencePhase::kPrefill)
+                {
+                    steps.acceptToken(a, greedy(referenceA[index]));
+                    bool rejected = false;
+                    try
+                    {
+                        steps.acceptToken(b, 0);
+                    }
+                    catch (std::logic_error const&)
+                    {
+                        rejected = true;
+                    }
+                    require(rejected, "Sample accepted during partial prefill");
+                }
+                else
+                {
+                    passed = compare("interleaved_B_final", referenceB, chunk, true) && passed;
+                }
+            }
+            require(index == 5 && steps.state(b).output().empty(), "Interleaved prompt accounting");
+            steps.acceptToken(b, greedy(referenceB));
+            passed = compare("interleaved_B_teacher", nextB, finish(steps.beginDecode({b, {}}, 1)), true) && passed;
+            require(observer.samplingBytes() == scratch, "Chunk forward touched sampler scratch");
+            require(steps.state(b).committedTokens() == 514 && steps.state(b).output().size() == 1,
+                "Final sample/cache accounting");
+            steps.release(a);
+            steps.release(b);
+        }
+        std::cout << "P3_INTERLEAVING_GATE passed=" << passed << std::endl;
+    }
+    observer.memory("p3_complete");
+    std::cout << "P3_QUALITY_GATE passed=" << passed << std::endl;
+    return passed;
+}
 } // namespace rt
 } // namespace trt_edgellm
 
 int main(int argc, char** argv)
 {
-    if (argc != 3 && (argc != 4 || std::string(argv[3]) != "--steps"))
+    if (argc != 3
+        && (argc != 4
+            || (std::string(argv[3]) != "--steps"
+                && (std::string(argv[3]) != "--chunks" && std::string(argv[3]) != "--chunks-extra"))))
     {
-        std::cerr << "Usage: continuous_batching_probe ENGINE_DIR CHECKPOINT_DIR [--steps]\n";
+        std::cerr << "Usage: continuous_batching_probe ENGINE_DIR CHECKPOINT_DIR [--steps|--chunks|--chunks-extra]\n";
         return 2;
     }
     cudaStream_t stream{};
@@ -600,7 +909,10 @@ int main(int argc, char** argv)
             trt_edgellm::rt::require(tokenizer.loadFromHF(argv[1], false), "Tokenizer loading failed");
             trt_edgellm::rt::LLMRankRuntime runtime(argv[1], "", {}, std::nullopt, stream,
                 trt_edgellm::rt::ParallelMapping{}, tokenizer, trt_edgellm::rt::ContextCacheConfig{}, argv[2], "");
-            passed = argc == 4 ? trt_edgellm::rt::runStepTests(runtime, tokenizer, stream)
+            passed = argc == 4 ? (std::string(argv[3]).find("--chunks") == 0
+                                         ? trt_edgellm::rt::runChunkTests(
+                                               runtime, tokenizer, stream, std::string(argv[3]) == "--chunks-extra")
+                                         : trt_edgellm::rt::runStepTests(runtime, tokenizer, stream))
                                : trt_edgellm::rt::runProbe(runtime, tokenizer, stream);
         }
         CUDA_CHECK(cudaStreamDestroy(stream));

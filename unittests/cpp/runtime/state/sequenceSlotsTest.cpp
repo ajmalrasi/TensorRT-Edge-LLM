@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "runtime/state/sequenceSlots.h"
+#include "runtime/state/prefillChunk.h"
 #include <gtest/gtest.h>
 #include <limits>
 #include <stdexcept>
@@ -11,6 +12,61 @@ namespace trt_edgellm
 {
 namespace rt
 {
+TEST(PrefillChunks, EverySupportedPromptPreservesTokensAndBounds)
+{
+    for (int32_t length = 1; length <= 6144; ++length)
+    {
+        SequenceSlots slots(2, 6144, 8192);
+        SequenceOptions options;
+        options.maxOutputTokens = 1;
+        std::vector<int32_t> prompt(length);
+        for (int32_t i = 0; i < length; ++i)
+        {
+            prompt[i] = i;
+        }
+        auto handle = slots.acquire(1, prompt, options);
+        int32_t consumed = 0;
+        while (consumed < length)
+        {
+            int32_t const count = nextPrefillChunkSize(length - consumed);
+            ASSERT_GT(count, 0);
+            ASSERT_LE(count, 128);
+            ASSERT_LE(count, length - consumed);
+            if (consumed > 0)
+            {
+                ASSERT_GE(count, 64);
+                ASSERT_EQ(consumed % 64, 0);
+            }
+            EXPECT_THROW(slots.acceptToken(handle, 0), std::logic_error);
+            for (int32_t i = 0; i < count; ++i)
+            {
+                ASSERT_EQ(slots.get(handle).prompt()[consumed + i], consumed + i);
+            }
+            slots.commitPrompt(handle, count);
+            consumed += count;
+            ASSERT_EQ(slots.get(handle).promptCursor(), consumed);
+            ASSERT_EQ(slots.get(handle).committedTokens(), consumed);
+            ASSERT_TRUE(slots.get(handle).output().empty());
+        }
+        ASSERT_EQ(slots.get(handle).phase(), SequencePhase::kAwaitingSample);
+        slots.acceptToken(handle, 7);
+        ASSERT_EQ(slots.get(handle).output().size(), 1U);
+        ASSERT_EQ(slots.get(handle).committedTokens(), length);
+        EXPECT_THROW(slots.acceptToken(handle, 7), std::logic_error);
+    }
+}
+
+TEST(PrefillChunks, InvalidRemaindersAndShortTails)
+{
+    EXPECT_THROW(nextPrefillChunkSize(0), std::logic_error);
+    EXPECT_THROW(nextPrefillChunkSize(-1), std::logic_error);
+    EXPECT_EQ(nextPrefillChunkSize(1), 1);
+    EXPECT_EQ(nextPrefillChunkSize(129), 64);
+    EXPECT_EQ(nextPrefillChunkSize(191), 64);
+    EXPECT_EQ(nextPrefillChunkSize(192), 128);
+    EXPECT_EQ(nextPrefillChunkSize(257), 128);
+}
+
 TEST(SequenceSlots, RejectsInvalidCapacity)
 {
     EXPECT_THROW(SequenceSlots(0, 8, 16), std::invalid_argument);
