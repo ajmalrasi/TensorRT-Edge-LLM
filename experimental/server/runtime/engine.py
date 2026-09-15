@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import (TYPE_CHECKING, Any, Dict, Iterator, List, Mapping,
                     Optional, Sequence, Union)
 
+from ..api.errors import ServerOverloadedError
 from ..config import ContextCacheConfig
 from ..parsing.tool_calling import (ToolConfig, parse_assistant_output,
                                     validate_tool_request)
@@ -107,6 +108,7 @@ class LogprobEntry:
     logprob: float
     token: str
     bytes: List[int]
+    chosen_only: bool = False
 
 
 def _convert_logprobs(raw) -> List[List[LogprobEntry]]:
@@ -650,6 +652,7 @@ class LLM:
         self,
         model: str,
         *,
+        engine_dir: str = "",
         cache_dir: str = "",
         engine_cache_max_size_gb: float = 50.0,
         clear_engine_cache: bool = False,
@@ -705,6 +708,18 @@ class LLM:
         self._prev_ctx_admitted_sequences = 0
         self._closed = False
         self._runtime = None
+
+        if engine_dir:
+            if not os.path.isdir(model):
+                raise ValueError(
+                    "an existing --engine-dir requires a local checkpoint "
+                    "directory for tokenizer and external weights")
+            self._cache_dir = ""
+            self._model_dir = os.path.abspath(model)
+            self._draft_model_dir = ""
+            self._init_from_bundle(os.path.abspath(engine_dir))
+            self._load_runtime()
+            return
 
         from .engine_build import BuildOptions, cache_root, prepare_model
 
@@ -865,8 +880,8 @@ class LLM:
         generation.stop_strings = params.stop
         generation.logit_bias = _normalize_logit_bias(params.logit_bias)
         options.generation = generation
-        options.stream_records = min(max(params.max_tokens + 2, 2), 8192) if stream else 0
-        options.stream_bytes = min(max(params.max_tokens * 16, 16384), 1 << 20)
+        options.stream_records = min(max(params.max_tokens + 2, 2), 64) if stream else 0
+        options.stream_bytes = 65536 if stream else 0
         return options
 
     def _submit_continuous(self, request, params: SamplingParams, *, stream: bool):
@@ -884,14 +899,22 @@ class LLM:
                 entries.append(LogprobEntry(entry.token, entry.logprob,
                                             piece.decode("utf-8", "replace"),
                                             list(piece)))
+            if not any(entry.token_id == sample.token for entry in entries):
+                piece = self._runtime.continuous_token_piece(sample.token)
+                entries.append(LogprobEntry(sample.token, sample.logprob,
+                                            piece.decode("utf-8", "replace"),
+                                            list(piece), chosen_only=True))
             converted.append(entries)
         return converted
 
     def _complete_continuous_request(self, request, params: SamplingParams,
                                      tool_config: ToolConfig, *, tool_parser: str,
-                                     reasoning_parser: str) -> CompletionOutput:
-        ticket = self._submit_continuous(request, params, stream=False)
+                                     reasoning_parser: str, ticket=None) -> CompletionOutput:
+        if ticket is None:
+            ticket = self._submit_continuous(request, params, stream=False)
         result = ticket.result()
+        if result.status == self._rt.SchedulerStatus.DEADLINE:
+            raise ServerOverloadedError("native request deadline expired")
         if result.status != self._rt.SchedulerStatus.COMPLETED:
             raise RuntimeError(f"continuous generation failed: {result.status}")
         finish_reason = {
@@ -906,9 +929,9 @@ class LLM:
             output.logprobs = self._continuous_logprobs(result.logprobs)
         return output
 
-    def generate_continuous_stream(self, request, params: SamplingParams) -> Iterator[StreamDelta]:
+    def generate_continuous_stream(self, request, params: SamplingParams, ticket=None) -> Iterator[StreamDelta]:
         """Read one P5 ticket channel; closing this iterator cancels only it."""
-        state = {}
+        state = {"ticket": ticket}
 
         def _cancel():
             ticket = state.get("ticket")
@@ -916,8 +939,10 @@ class LLM:
                 ticket.cancel()
 
         def _iterate():
-            ticket = self._submit_continuous(request, params, stream=True)
-            state["ticket"] = ticket
+            ticket = state["ticket"]
+            if ticket is None:
+                ticket = self._submit_continuous(request, params, stream=True)
+                state["ticket"] = ticket
             terminal = None
             try:
                 while True:
@@ -925,10 +950,13 @@ class LLM:
                     if read.update is not None:
                         update = read.update
                         yield StreamDelta(text=update.text,
-                                          token_ids=[update.sample.token],
-                                          logprobs=self._continuous_logprobs([update.sample]))
+                                          token_ids=([update.sample.token] if update.sample.token >= 0 else []),
+                                          logprobs=(self._continuous_logprobs([update.sample])
+                                                    if params.num_logprobs and update.sample.token >= 0 else []))
                     if read.closed:
                         terminal = ticket.result()
+                        if terminal.status == self._rt.SchedulerStatus.DEADLINE:
+                            raise ServerOverloadedError("native request deadline expired")
                         if terminal.status != self._rt.SchedulerStatus.COMPLETED:
                             raise RuntimeError(
                                 f"continuous generation failed: {terminal.status}")

@@ -45,6 +45,8 @@ class _ReleasingStreamingResponse(StreamingResponse):
 async def health(request: Request):
     client = request.app.state.engine_client
     caps = client.capabilities
+    if not client.healthy:
+        return JSONResponse(status_code=503, content={"status": "unhealthy"})
     return {
         "status": "healthy",
         "model": client.model_name,
@@ -71,6 +73,8 @@ async def health(request: Request):
 @router.get("/health/ready")
 async def readiness(request: Request):
     client = request.app.state.engine_client
+    if not client.healthy:
+        return JSONResponse(status_code=503, content={"status": "unready"})
     return {
         "status": "ready",
         "active_requests": client.active_requests,
