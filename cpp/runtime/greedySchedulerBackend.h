@@ -5,16 +5,20 @@
 #pragma once
 #include "runtime/continuousScheduler.h"
 #include "runtime/sequenceStepRuntime.h"
-
 namespace trt_edgellm
 {
+namespace tokenizer
+{
+class Tokenizer;
+}
 namespace rt
 {
-//! P4-only greedy adapter. Borrowed runtime and explicit stream outlive this exclusive lease.
-class GreedySchedulerBackend : public SchedulerBackend
+//! Independent CPU policy over one sampling-free TensorRT runtime. All forward methods belong to the scheduler worker.
+class SamplingSchedulerBackend : public SchedulerBackend
 {
 public:
-    GreedySchedulerBackend(LLMRankRuntime& runtime, cudaStream_t stream, int32_t vocabularySize);
+    SamplingSchedulerBackend(LLMRankRuntime& runtime, cudaStream_t stream, int32_t vocabularySize,
+        tokenizer::Tokenizer const* tokenizer = nullptr);
     void start() override;
     void invalidate() noexcept override
     {
@@ -24,19 +28,38 @@ public:
     {
         return token >= 0 && token < mVocabulary;
     }
-    SequenceHandle acquire(uint64_t id, std::vector<int32_t> prompt, int32_t maxOutput) override;
+    int32_t vocabularySize() const override
+    {
+        return mVocabulary;
+    }
+    SequenceOptions normalizeOptions(SequenceOptions options) const override;
+    SequenceHandle acquire(uint64_t id, std::vector<int32_t> prompt, SequenceOptions options) override;
     SequenceState const& state(SequenceHandle handle) const override;
     void prefill(SequenceHandle handle) override;
     void decode(std::array<SequenceHandle, 2> const& handles, int32_t count) override;
     void release(SequenceHandle handle) override;
+    SequenceSample lastSample(SequenceHandle handle) const override;
+    std::string_view text(SequenceHandle handle) const override;
+    std::vector<SequenceSample> const& logprobs(SequenceHandle handle) const override;
+    SequenceFinish finishReason(SequenceHandle handle) const override;
+    void finalize(SequenceHandle handle) override;
 
 private:
     void sample(Tensor const& logits, std::array<SequenceHandle, 2> const& handles, int32_t count);
+    SequencePolicy const& policy(SequenceHandle handle) const;
     SequenceStepRuntime mSteps;
     cudaStream_t mStream;
     int32_t mVocabulary;
     int mDevice{};
     Tensor mHostLogits;
+    SequenceSampler mSampler;
+    std::array<SequencePolicy, 2> mPolicies;
+    std::vector<std::string> mPieces;
+    size_t mMaxPieceBytes{};
+    std::vector<int32_t> mEos;
+    int32_t mPrimaryEos{-1}, mThinkStart{-1}, mThinkEnd{-1};
 };
+//! P4 source compatibility name; the options-based API applies full independent policy.
+using GreedySchedulerBackend = SamplingSchedulerBackend;
 } // namespace rt
 } // namespace trt_edgellm

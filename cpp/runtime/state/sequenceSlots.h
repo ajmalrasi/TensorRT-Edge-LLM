@@ -31,6 +31,10 @@ struct SequenceOptions
     uint64_t seed{42};
     int32_t numLogprobs{};
     bool enableThinking{};
+    bool ignoreEos{};
+    int32_t primaryEosTokenId{-1};
+    int32_t thinkingStartTokenId{-1};
+    int32_t thinkingEndTokenId{-1};
     std::vector<int32_t> eosTokenIds;
     std::vector<std::string> stopStrings;
     std::unordered_map<int32_t, float> logitBias;

@@ -977,6 +977,241 @@ bool runSchedulerTests(LLMRankRuntime& runtime, tokenizer::Tokenizer& tokenizer,
               << " b_continued=" << bContinued << " paired_decode=" << pair << std::endl;
     return passed;
 }
+bool runPolicyTests(LLMRankRuntime& runtime, tokenizer::Tokenizer& tokenizer, cudaStream_t stream)
+{
+    ContinuousBatchingProbe observer(runtime, stream);
+    auto const words = tokenizer.encode("A fox crosses a river. Explain the colors and count to five. ");
+    auto prompt = [&](int32_t length) {
+        std::vector<int32_t> tokens;
+        tokens.reserve(length);
+        for (int32_t i = 0; i < length; ++i)
+        {
+            tokens.push_back(words.at(i % words.size()));
+        }
+        return tokens;
+    };
+    auto const pa = prompt(65), pb = prompt(513), pc = prompt(129);
+    SchedulerRequestOptions oa, ob, oc;
+    oa.generation.maxOutputTokens = 6;
+    oa.generation.temperature = 0.7F;
+    oa.generation.topK = 20;
+    oa.generation.topP = 0.9F;
+    oa.generation.seed = 123;
+    oa.generation.numLogprobs = 5;
+    oa.generation.ignoreEos = true;
+    ob = oa;
+    ob.generation.maxOutputTokens = 12;
+    ob.generation.temperature = 1.2F;
+    ob.generation.topK = 40;
+    ob.generation.seed = 456;
+    ob.generation.numLogprobs = 0;
+    oc = oa;
+    oc.generation.maxOutputTokens = 12;
+    oc.generation.temperature = 0;
+    oc.generation.topK = 1;
+    oc.generation.numLogprobs = 2;
+    std::atomic<bool> armed{false};
+    bool submitted = false;
+    ContinuousScheduler* owner = nullptr;
+    SchedulerTicket b, c;
+    bool paired = false;
+    std::atomic<bool> cancelMode{false};
+    bool cancelSubmitted = false;
+    SchedulerTicket nativeB, nativeC;
+    auto get = [&](SchedulerTicket const& ticket) {
+        require(
+            ticket.result().wait_for(std::chrono::seconds(60)) == std::future_status::ready, "Policy ticket stranded");
+        return ticket.result().get();
+    };
+    {
+        ContinuousScheduler scheduler(
+            std::make_unique<SamplingSchedulerBackend>(runtime, stream, observer.vocabularySize(), &tokenizer), 8,
+            262144, [&](SchedulerEvent const& e) {
+                if (cancelMode.load())
+                {
+                    if (!cancelSubmitted && e.kind == SchedulerEvent::Kind::kDecode)
+                    {
+                        cancelSubmitted = true;
+                        nativeB = owner->submit(pb, ob);
+                        nativeC = owner->submit(pc, oc);
+                        nativeC.cancel();
+                    }
+                    if (cancelSubmitted && e.request == nativeB.id() && e.kind == SchedulerEvent::Kind::kPrefill)
+                    {
+                        nativeB.cancel();
+                    }
+                }
+                if (armed.load() && e.kind == SchedulerEvent::Kind::kDecode)
+                {
+                    if (!submitted)
+                    {
+                        submitted = true;
+                        b = owner->submit(pb, ob);
+                        c = owner->submit(pc, oc);
+                    }
+                    if (e.partner)
+                    {
+                        paired = true;
+                    }
+                }
+            });
+        owner = &scheduler;
+        auto const ra = get(scheduler.submit(pa, oa)), rb = get(scheduler.submit(pb, ob)),
+                   rc = get(scheduler.submit(pc, oc));
+        armed.store(true);
+        auto const a = scheduler.submit(pa, oa);
+        auto const aa = get(a), ab = get(b), ac = get(c);
+        armed.store(false);
+        require(aa.status == SchedulerStatus::kCompleted && ab.status == SchedulerStatus::kCompleted
+                && ac.status == SchedulerStatus::kCompleted,
+            "Mixed requests failed");
+        require(aa.tokens == ra.tokens && ab.tokens == rb.tokens && ac.tokens == rc.tokens,
+            "Seeded serial/concurrent mismatch");
+        require(aa.text == ra.text && ab.text == rb.text && ac.text == rc.text, "Independent text mismatch");
+        require(aa.tokens.size() == 6 && ab.tokens.size() == 12 && ac.tokens.size() == 12 && paired,
+            "Mixed batch/limits missing");
+        require(
+            aa.randomCounter == 6 && ab.randomCounter == 12 && ac.randomCounter == 0, "RNG counters crossed requests");
+        require(aa.logprobs.size() == 6 && ab.logprobs.empty() && ac.logprobs.size() == 12
+                && aa.logprobs.front().topCount == 5 && ac.logprobs.front().topCount == 2,
+            "Logprob history missing");
+        for (size_t i = 0; i < aa.logprobs.size(); ++i)
+        {
+            require(aa.logprobs[i].logprob == ra.logprobs[i].logprob, "Logprob baseline mismatch");
+        }
+        std::cout << "P5_MIXED_GATE passed=1 outputs=6,12,12 rng=6,12,0 paired=1 exact_seeded=1" << std::endl;
+        auto stopOptions = oc;
+        stopOptions.generation.ignoreEos = false;
+        stopOptions.generation.numLogprobs = 50;
+        int32_t const forced = tokenizer.encode("Z").at(0);
+        auto const piece = tokenizer.idToPiece(forced, true);
+        require(!piece.empty(), "Empty forced token piece");
+        stopOptions.generation.logitBias[forced] = 100;
+        stopOptions.generation.stopStrings = {piece + piece};
+        stopOptions.streamRecords = 8;
+        auto stopTicket = scheduler.submit(pa, stopOptions);
+        auto stopped = get(stopTicket);
+        require(stopped.status == SchedulerStatus::kCompleted && stopped.finish == SequenceFinish::kStop
+                && stopped.tokens.size() == 2 && stopped.text.empty(),
+            "Cross-token stop failed");
+        std::string streamed;
+        while (true)
+        {
+            auto next = stopTicket.read(std::chrono::milliseconds(0));
+            if (next.update)
+            {
+                streamed += next.update->text;
+            }
+            if (next.closed)
+            {
+                break;
+            }
+        }
+        require(streamed.empty(), "Stop prefix leaked to stream");
+        auto eosOptions = oc;
+        eosOptions.generation.ignoreEos = false;
+        eosOptions.generation.logitBias[tokenizer.getEosId()] = 100;
+        auto eos = get(scheduler.submit(pa, eosOptions));
+        require(eos.finish == SequenceFinish::kEos && eos.tokens.size() == 1 && eos.text.empty(), "Primary EOS failed");
+        auto slowOptions = oa;
+        slowOptions.streamRecords = 1;
+        slowOptions.streamBytes = 32;
+        auto slow = scheduler.submit(pa, slowOptions);
+        auto peer = scheduler.submit(pb, ob);
+        require(get(slow).status == SchedulerStatus::kSlowConsumer, "Slow consumer not terminated");
+        require(get(peer).tokens == rb.tokens, "Slow consumer corrupted partner");
+        auto deadlineOptions = oa;
+        deadlineOptions.queueDeadline = std::chrono::steady_clock::now() - std::chrono::milliseconds(1);
+        require(
+            get(scheduler.submit(pa, deadlineOptions)).status == SchedulerStatus::kDeadline, "Queue deadline failed");
+        auto streamOptions = oa;
+        streamOptions.streamRecords = 32;
+        auto streamTicket = scheduler.submit(pa, streamOptions);
+        auto streamResult = get(streamTicket);
+        std::string streamText;
+        size_t recordCount = 0;
+        while (true)
+        {
+            auto next = streamTicket.read(std::chrono::milliseconds(0));
+            if (next.update)
+            {
+                streamText += next.update->text;
+                if (next.update->sample.token >= 0)
+                {
+                    ++recordCount;
+                }
+            }
+            if (next.closed)
+            {
+                break;
+            }
+        }
+        require(streamText == streamResult.text && recordCount == 6, "Streaming result differs from final result");
+        cancelMode.store(true);
+        auto cancellationLeader = scheduler.submit(pa, oa);
+        auto leaderResult = get(cancellationLeader);
+        require(leaderResult.tokens == ra.tokens, "Prefill cancellation changed partner output");
+        require(
+            get(nativeB).status == SchedulerStatus::kCancelled && get(nativeC).status == SchedulerStatus::kCancelled,
+            "Native active/queued cancellation failed");
+        cancelMode.store(false);
+        nativeB.cancel();
+        require(get(scheduler.submit(pc, oc)).tokens == rc.tokens, "Stale ticket affected reused slot");
+        auto activeDeadline = oa;
+        activeDeadline.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+        require(get(scheduler.submit(prompt(2049), activeDeadline)).status == SchedulerStatus::kDeadline,
+            "Native active deadline failed");
+        require(get(scheduler.submit(pa, oa)).tokens == ra.tokens, "Deadline cleanup changed later output");
+        std::cout
+            << "P5_CANCEL_GATE passed=1 prefill_cancel=1 queued_cancel=1 stale_ticket=1 active_deadline=1 peer_exact=1"
+            << std::endl;
+        scheduler.close();
+        require(scheduler.healthy(), "Policy tests poisoned healthy runtime");
+        std::cout << "P5_STOP_STREAM_GATE passed=1 stop_tokens=2 eos_tokens=1 logprob_top=50 slow_peer_exact=1"
+                  << std::endl;
+    }
+    // Inject a reported corrupting failure after real GPU work without deliberately damaging the device.
+    class InjectedFailure : public SamplingSchedulerBackend
+    {
+    public:
+        using SamplingSchedulerBackend::SamplingSchedulerBackend;
+        void prefill(SequenceHandle handle) override
+        {
+            SamplingSchedulerBackend::prefill(handle);
+            throw std::runtime_error("injected post-forward CUDA failure");
+        }
+    };
+    {
+        ContinuousScheduler failed(
+            std::make_unique<InjectedFailure>(runtime, stream, observer.vocabularySize(), &tokenizer));
+        auto ticket = failed.submit(pa, oa);
+        require(get(ticket).status == SchedulerStatus::kFailed, "Fault left ticket live");
+        failed.close();
+        require(!failed.healthy(), "Fault failed to mark scheduler unready");
+        bool rejected = false;
+        try
+        {
+            failed.submit(pa, oa);
+        }
+        catch (std::exception const&)
+        {
+            rejected = true;
+        }
+        require(rejected, "Failed scheduler admitted request");
+    }
+    bool poisoned = false;
+    try
+    {
+        SequenceStepRuntime forbidden(runtime, stream);
+    }
+    catch (std::exception const&)
+    {
+        poisoned = true;
+    }
+    require(poisoned, "Failed sampling released parent lease");
+    std::cout << "P5_FAULT_GATE passed=1 injected_post_forward=1 parent_lease_poisoned=1" << std::endl;
+    return true;
+}
 } // namespace rt
 } // namespace trt_edgellm
 
@@ -984,11 +1219,12 @@ int main(int argc, char** argv)
 {
     if (argc != 3
         && (argc != 4
-            || (std::string(argv[3]) != "--scheduler" && std::string(argv[3]) != "--steps"
+            || (std::string(argv[3]) != "--policies" && std::string(argv[3]) != "--scheduler"
+                && std::string(argv[3]) != "--steps"
                 && (std::string(argv[3]) != "--chunks" && std::string(argv[3]) != "--chunks-extra"))))
     {
         std::cerr << "Usage: continuous_batching_probe ENGINE_DIR CHECKPOINT_DIR "
-                     "[--steps|--chunks|--chunks-extra|--scheduler]\n";
+                     "[--steps|--chunks|--chunks-extra|--scheduler|--policies]\n";
         return 2;
     }
     cudaStream_t stream{};
@@ -1003,7 +1239,9 @@ int main(int argc, char** argv)
             trt_edgellm::rt::require(tokenizer.loadFromHF(argv[1], false), "Tokenizer loading failed");
             trt_edgellm::rt::LLMRankRuntime runtime(argv[1], "", {}, std::nullopt, stream,
                 trt_edgellm::rt::ParallelMapping{}, tokenizer, trt_edgellm::rt::ContextCacheConfig{}, argv[2], "");
-            passed = argc == 4 && std::string(argv[3]) == "--scheduler"
+            passed = argc == 4 && std::string(argv[3]) == "--policies"
+                ? trt_edgellm::rt::runPolicyTests(runtime, tokenizer, stream)
+                : argc == 4 && std::string(argv[3]) == "--scheduler"
                 ? trt_edgellm::rt::runSchedulerTests(runtime, tokenizer, stream)
                 : argc == 4 ? (std::string(argv[3]).find("--chunks") == 0
                                       ? trt_edgellm::rt::runChunkTests(

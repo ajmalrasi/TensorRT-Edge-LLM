@@ -31,10 +31,24 @@ ContinuousScheduler::~ContinuousScheduler()
 
 SchedulerTicket ContinuousScheduler::submit(std::vector<int32_t> const& prompt, int32_t maxOutput)
 {
-    if (prompt.empty() || prompt.size() > 6144 || maxOutput <= 0
-        || maxOutput > 8192 - static_cast<int32_t>(prompt.size()))
+    SchedulerRequestOptions options;
+    options.generation.maxOutputTokens = maxOutput;
+    options.generation.temperature = 0;
+    options.generation.ignoreEos = true;
+    return submit(prompt, options);
+}
+SchedulerTicket ContinuousScheduler::submit(std::vector<int32_t> const& prompt, SchedulerRequestOptions const& input)
+{
+    validateSequenceOptions(input.generation, mBackend->vocabularySize());
+    auto options = input;
+    options.generation = mBackend->normalizeOptions(options.generation);
+    auto const& generation = options.generation;
+    size_t const metadata = validateSequenceOptions(generation, mBackend->vocabularySize());
+    if (prompt.empty() || prompt.size() > 6144
+        || generation.maxOutputTokens > 8192 - static_cast<int32_t>(prompt.size()) || options.streamRecords > 8192
+        || (options.streamRecords && (!options.streamBytes || options.streamBytes > 1048576)))
     {
-        throw std::invalid_argument("P4 request exceeds qualified token bounds");
+        throw std::invalid_argument("Request exceeds native bounds");
     }
     for (auto token : prompt)
     {
@@ -43,12 +57,15 @@ SchedulerTicket ContinuousScheduler::submit(std::vector<int32_t> const& prompt, 
             throw std::invalid_argument("Token outside supported vocabulary");
         }
     }
+    size_t const bytes = prompt.size() * sizeof(int32_t) + metadata
+        + (options.streamRecords
+                ? options.streamRecords * (sizeof(SequenceSample) + sizeof(size_t)) + options.streamBytes
+                : 0);
     std::lock_guard<std::mutex> lock(mMutex);
     if (mClosing || !mHealthy.load())
     {
         throw std::runtime_error("Scheduler closed or failed");
     }
-    size_t const bytes = prompt.size() * sizeof(int32_t);
     if (mQueue.size() >= mMaxQueued || bytes > mMaxQueuedBytes - mQueuedBytes)
     {
         throw std::runtime_error("Scheduler queue full");
@@ -60,11 +77,19 @@ SchedulerTicket ContinuousScheduler::submit(std::vector<int32_t> const& prompt, 
     auto request = std::make_unique<Request>();
     request->id = ++mNextId;
     request->prompt = prompt;
-    request->maxOutput = maxOutput;
+    request->promptTokens = static_cast<int32_t>(prompt.size());
+    request->options = std::move(options);
+    request->bytes = bytes;
     request->cancelled = std::make_shared<std::atomic<bool>>(false);
+    if (request->options.streamRecords)
+    {
+        request->channel
+            = std::make_shared<SequenceChannel>(request->options.streamRecords, request->options.streamBytes);
+    }
     SchedulerTicket ticket;
     ticket.mId = request->id;
     ticket.mCancelled = request->cancelled;
+    ticket.mChannel = request->channel;
     ticket.mResult = request->promise.get_future().share();
     mQueue.push_back(std::move(request));
     mQueuedBytes += bytes;
@@ -110,56 +135,122 @@ void ContinuousScheduler::terminal(
     SchedulerResult result;
     result.status = status;
     result.error = error;
+    result.promptTokens = request->promptTokens;
     if (release)
     {
+        mBackend->finalize(request->handle);
+        auto const text = mBackend->text(request->handle);
+        if (request->channel && text.size() > request->publishedBytes && status != SchedulerStatus::kSlowConsumer)
+        {
+            SequenceSample flush;
+            if (!request->channel->push(flush, text.substr(request->publishedBytes)))
+            {
+                result.status = SchedulerStatus::kSlowConsumer;
+            }
+        }
         result.tokens = mBackend->state(request->handle).output();
+        result.randomCounter = mBackend->state(request->handle).randomCounter();
+        if (!text.empty())
+        {
+            result.text.assign(text.data(), text.size());
+        }
+        result.logprobs = mBackend->logprobs(request->handle);
+        result.finish = mBackend->finishReason(request->handle);
         emit(SchedulerEvent::Kind::kRelease, request.get());
         mBackend->release(request->handle);
+    }
+    auto channel = request->channel;
+    if (channel)
+    {
+        channel->close();
     }
     request->promise.set_value(std::move(result));
     request.reset();
 }
+void ContinuousScheduler::publish(std::unique_ptr<Request>& request)
+{
+    auto const count = mBackend->state(request->handle).output().size();
+    if (count == request->publishedTokens)
+    {
+        return;
+    }
+    auto const text = mBackend->text(request->handle);
+    if (request->channel
+        && !request->channel->push(mBackend->lastSample(request->handle), text.substr(request->publishedBytes)))
+    {
+        terminal(request, SchedulerStatus::kSlowConsumer, true);
+        return;
+    }
+    request->publishedTokens = count;
+    request->publishedBytes = text.size();
+}
 void ContinuousScheduler::boundary()
 {
-    // No GPU work is outstanding here. Reclaim before admission, including between decode and prefill.
+    auto const now = std::chrono::steady_clock::now();
     for (auto& request : mActive)
     {
         if (!request)
         {
             continue;
         }
-        if (request->cancelled->load())
+        bool const finished = mBackend->state(request->handle).phase() == SequencePhase::kFinished;
+        // Natural completion is already committed by the forward before a late cancellation is observed.
+        if (finished)
+        {
+            publish(request);
+            if (request)
+            {
+                terminal(request, SchedulerStatus::kCompleted, true);
+            }
+        }
+        else if (request->cancelled->load())
         {
             terminal(request, SchedulerStatus::kCancelled, true);
         }
-        else if (mBackend->state(request->handle).phase() == SequencePhase::kFinished)
+        else if (now >= request->options.deadline)
         {
-            terminal(request, SchedulerStatus::kCompleted, true);
+            terminal(request, SchedulerStatus::kDeadline, true);
+        }
+        else
+        {
+            publish(request);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        for (auto it = mQueue.begin(); it != mQueue.end();)
+        {
+            bool const cancelled = (*it)->cancelled->load();
+            if (cancelled || now >= (*it)->options.deadline || now >= (*it)->options.queueDeadline)
+            {
+                mQueuedBytes -= (*it)->bytes;
+                terminal(*it, cancelled ? SchedulerStatus::kCancelled : SchedulerStatus::kDeadline, false);
+                it = mQueue.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
         }
     }
     for (auto& request : mActive)
     {
-        size_t examined = 0;
-        while (!request && examined++ < mMaxQueued)
+        if (request)
         {
-            {
-                std::lock_guard<std::mutex> lock(mMutex);
-                if (mClosing || mQueue.empty())
-                {
-                    break;
-                }
-                request = std::move(mQueue.front());
-                mQueue.pop_front();
-                mQueuedBytes -= request->prompt.size() * sizeof(int32_t);
-            }
-            if (request->cancelled->load())
-            {
-                terminal(request, SchedulerStatus::kCancelled, false);
-                continue;
-            }
-            request->handle = mBackend->acquire(request->id, std::move(request->prompt), request->maxOutput);
-            emit(SchedulerEvent::Kind::kAdmit, request.get());
+            continue;
         }
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            if (mClosing || mQueue.empty())
+            {
+                break;
+            }
+            request = std::move(mQueue.front());
+            mQueue.pop_front();
+            mQueuedBytes -= request->bytes;
+        }
+        request->handle = mBackend->acquire(request->id, std::move(request->prompt), request->options.generation);
+        emit(SchedulerEvent::Kind::kAdmit, request.get());
     }
 }
 void ContinuousScheduler::run() noexcept

@@ -3,11 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #pragma once
+#include "runtime/state/sequenceChannel.h"
 #include "runtime/state/sequenceSlots.h"
 #include <array>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -18,7 +20,7 @@ namespace trt_edgellm
 namespace rt
 {
 //! Forward methods are worker-only; validToken must read immutable metadata and be thread-safe.
-//! Worker-only forward boundary. Implementations complete GPU work and accept one greedy token per ready row.
+//! Forward implementations finish GPU work and apply each row’s independent policy before returning.
 class SchedulerBackend
 {
 public:
@@ -29,7 +31,35 @@ public:
     {
         return token >= 0;
     }
-    virtual SequenceHandle acquire(uint64_t id, std::vector<int32_t> prompt, int32_t maxOutput) = 0;
+    virtual int32_t vocabularySize() const
+    {
+        return 248320;
+    }
+    virtual SequenceOptions normalizeOptions(SequenceOptions options) const
+    {
+        return options;
+    }
+    virtual SequenceHandle acquire(uint64_t id, std::vector<int32_t> prompt, SequenceOptions options) = 0;
+    virtual SequenceSample lastSample(SequenceHandle handle) const
+    {
+        SequenceSample sample;
+        sample.token = state(handle).output().back();
+        return sample;
+    }
+    virtual std::string_view text(SequenceHandle) const
+    {
+        return {};
+    }
+    virtual std::vector<SequenceSample> const& logprobs(SequenceHandle) const
+    {
+        static std::vector<SequenceSample> const empty;
+        return empty;
+    }
+    virtual SequenceFinish finishReason(SequenceHandle) const
+    {
+        return SequenceFinish::kLength;
+    }
+    virtual void finalize(SequenceHandle) {}
     virtual SequenceState const& state(SequenceHandle handle) const = 0;
     virtual void prefill(SequenceHandle handle) = 0;
     virtual void decode(std::array<SequenceHandle, 2> const& handles, int32_t count) = 0;
@@ -40,13 +70,20 @@ enum class SchedulerStatus
 {
     kCompleted,
     kCancelled,
-    kFailed
+    kFailed,
+    kDeadline,
+    kSlowConsumer
 };
 struct SchedulerResult
 {
     SchedulerStatus status{SchedulerStatus::kFailed};
     std::vector<int32_t> tokens;
     std::exception_ptr error;
+    std::string text;
+    std::vector<SequenceSample> logprobs;
+    SequenceFinish finish{SequenceFinish::kNone};
+    int32_t promptTokens{};
+    uint64_t randomCounter{};
 };
 
 //! Ticket cancellation targets its submission, never a recycled physical slot.
@@ -64,6 +101,14 @@ public:
             mCancelled->store(true);
         }
     }
+    SequenceRead read(std::chrono::milliseconds timeout) const
+    {
+        if (!mChannel)
+        {
+            throw std::logic_error("Ticket has no stream");
+        }
+        return mChannel->read(timeout);
+    }
     std::shared_future<SchedulerResult> result() const
     {
         return mResult;
@@ -73,6 +118,7 @@ private:
     friend class ContinuousScheduler;
     uint64_t mId{};
     std::shared_ptr<std::atomic<bool>> mCancelled;
+    std::shared_ptr<SequenceChannel> mChannel;
     std::shared_future<SchedulerResult> mResult;
 };
 
@@ -95,7 +141,16 @@ struct SchedulerEvent
     int64_t microseconds{};
 };
 
-//! Internal P4 scheduler: prepared text tokens, greedy sampling and length termination only.
+struct SchedulerRequestOptions
+{
+    SequenceOptions generation;
+    std::chrono::steady_clock::time_point queueDeadline{std::chrono::steady_clock::time_point::max()};
+    std::chrono::steady_clock::time_point deadline{std::chrono::steady_clock::time_point::max()};
+    size_t streamRecords{};
+    size_t streamBytes{16384};
+};
+
+//! Independent request policy with one execution owner and bounded admission/output channels.
 //! Parent runtime and stream must outlive close/destruction. Public submission and close are thread-safe.
 class ContinuousScheduler
 {
@@ -105,6 +160,7 @@ public:
         size_t maxQueuedBytes = 256 * 1024, Observer observer = {});
     ~ContinuousScheduler();
     SchedulerTicket submit(std::vector<int32_t> const& prompt, int32_t maxOutput);
+    SchedulerTicket submit(std::vector<int32_t> const& prompt, SchedulerRequestOptions const& options);
     void close();
     bool healthy() const
     {
@@ -116,13 +172,19 @@ private:
     {
         uint64_t id{};
         std::vector<int32_t> prompt;
-        int32_t maxOutput{};
+        SchedulerRequestOptions options;
+        size_t bytes{};
+        size_t publishedTokens{};
+        size_t publishedBytes{};
+        int32_t promptTokens{};
+        std::shared_ptr<SequenceChannel> channel;
         std::shared_ptr<std::atomic<bool>> cancelled;
         std::promise<SchedulerResult> promise;
         SequenceHandle handle{};
     };
     void run() noexcept;
     void boundary();
+    void publish(std::unique_ptr<Request>& request);
     void emit(SchedulerEvent::Kind kind, Request const* request = nullptr, uint64_t partner = 0);
     void terminal(
         std::unique_ptr<Request>& request, SchedulerStatus status, bool release, std::exception_ptr error = {});

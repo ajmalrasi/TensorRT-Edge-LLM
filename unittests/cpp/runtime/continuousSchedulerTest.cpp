@@ -24,10 +24,8 @@ public:
             gate.wait();
         }
     }
-    SequenceHandle acquire(uint64_t id, std::vector<int32_t> prompt, int32_t maxOutput) override
+    SequenceHandle acquire(uint64_t id, std::vector<int32_t> prompt, SequenceOptions options) override
     {
-        SequenceOptions options;
-        options.maxOutputTokens = maxOutput;
         return slots.acquire(id, std::move(prompt), options);
     }
     SequenceState const& state(SequenceHandle h) const override
@@ -289,4 +287,109 @@ TEST(ContinuousScheduler, ConcurrentProducersAndRepeatedReuse)
     }
     scheduler.close();
     EXPECT_TRUE(scheduler.healthy());
+}
+
+TEST(ContinuousScheduler, SlowConsumerDoesNotBlockPartner)
+{
+    std::promise<void> gate;
+    auto backend = std::make_unique<FakeBackend>();
+    backend->gate = gate.get_future().share();
+    ContinuousScheduler scheduler(std::move(backend));
+    SchedulerRequestOptions options;
+    options.generation.maxOutputTokens = 10;
+    options.streamRecords = 1;
+    options.streamBytes = 8;
+    auto slow = scheduler.submit({1}, options);
+    auto peer = scheduler.submit({1}, 8);
+    gate.set_value();
+    EXPECT_EQ(result(slow).status, SchedulerStatus::kSlowConsumer);
+    EXPECT_EQ(result(peer).tokens.size(), 8U);
+    auto read = slow.read(0ms);
+    ASSERT_TRUE(read.update);
+    EXPECT_TRUE(read.closed);
+    EXPECT_TRUE(scheduler.healthy());
+}
+TEST(ContinuousScheduler, QueuedCancellationWhileBothSlotsOccupied)
+{
+    ContinuousScheduler* owner = nullptr;
+    SchedulerTicket queued;
+    std::atomic<bool> cancelledReady{false};
+    bool submitted = false;
+    ContinuousScheduler scheduler(std::make_unique<FakeBackend>(), 8, 65536, [&](auto const& e) {
+        if (e.kind == SchedulerEvent::Kind::kDecode && !submitted)
+        {
+            submitted = true;
+            queued = owner->submit({1}, 3);
+            queued.cancel();
+        }
+        else if (submitted && e.kind == SchedulerEvent::Kind::kDecode)
+        {
+            cancelledReady = queued.result().wait_for(0ms) == std::future_status::ready;
+        }
+    });
+    owner = &scheduler;
+    auto a = scheduler.submit({1}, 20);
+    auto b = scheduler.submit({1}, 20);
+    result(a);
+    result(b);
+    scheduler.close();
+    EXPECT_EQ(result(queued).status, SchedulerStatus::kCancelled);
+    EXPECT_TRUE(cancelledReady);
+}
+TEST(ContinuousScheduler, QueueAndActiveDeadlines)
+{
+    std::promise<void> gate;
+    auto backend = std::make_unique<FakeBackend>();
+    backend->gate = gate.get_future().share();
+    SchedulerRequestOptions options;
+    options.generation.maxOutputTokens = 5;
+    options.queueDeadline = std::chrono::steady_clock::now() - 1ms;
+    ContinuousScheduler scheduler(std::move(backend));
+    auto expired = scheduler.submit({1}, options);
+    gate.set_value();
+    EXPECT_EQ(result(expired).status, SchedulerStatus::kDeadline);
+    scheduler.close();
+    SchedulerRequestOptions active;
+    active.generation.maxOutputTokens = 100;
+    active.deadline = std::chrono::steady_clock::now() + 20ms;
+    bool delayed = false;
+    ContinuousScheduler other(std::make_unique<FakeBackend>(), 8, 65536, [&](auto const& e) {
+        if (e.kind == SchedulerEvent::Kind::kPrefill && !delayed)
+        {
+            delayed = true;
+            std::this_thread::sleep_for(30ms);
+        }
+    });
+    auto a = other.submit({1}, active);
+    EXPECT_EQ(result(a).status, SchedulerStatus::kDeadline);
+    EXPECT_EQ(result(other.submit({1}, 3)).status, SchedulerStatus::kCompleted);
+}
+TEST(ContinuousScheduler, DecodeCancellationAndStartupFailure)
+{
+    SchedulerTicket a;
+    std::promise<void> gate;
+    auto backend = std::make_unique<FakeBackend>();
+    backend->gate = gate.get_future().share();
+    ContinuousScheduler scheduler(std::move(backend), 8, 65536, [&](auto const& e) {
+        if (e.kind == SchedulerEvent::Kind::kDecode && e.request == a.id())
+        {
+            a.cancel();
+        }
+    });
+    a = scheduler.submit({1}, 10);
+    auto b = scheduler.submit({1}, 12);
+    gate.set_value();
+    EXPECT_EQ(result(a).status, SchedulerStatus::kCancelled);
+    EXPECT_EQ(result(b).tokens.size(), 12U);
+    class BrokenStart : public FakeBackend
+    {
+        void start() override
+        {
+            throw std::runtime_error("startup failure");
+        }
+    };
+    ContinuousScheduler broken(std::make_unique<BrokenStart>());
+    std::this_thread::sleep_for(10ms);
+    EXPECT_FALSE(broken.healthy());
+    EXPECT_THROW(broken.submit({1}, 1), std::runtime_error);
 }
