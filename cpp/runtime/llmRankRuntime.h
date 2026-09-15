@@ -239,6 +239,18 @@ public:
         return mDecoderRegistry && mDecoderRegistry->hasSpeculativeDecoder();
     }
 
+    //! Metadata borrowed by the single-rank continuous scheduler. The scheduler
+    //! never owns either object and must be destroyed before this runtime.
+    tokenizer::Tokenizer const& tokenizer() const
+    {
+        ELLM_CHECK(mTokenizer != nullptr, "LLMRankRuntime tokenizer is not initialized.");
+        return *mTokenizer;
+    }
+    int32_t vocabularySize() const
+    {
+        return mDeployment.base.vocabSize;
+    }
+
 private:
     friend class ContinuousBatchingProbe;
     friend class SequenceStepRuntime;

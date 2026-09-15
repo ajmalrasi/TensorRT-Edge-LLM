@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "runtime/continuousScheduler.h"
+#include <algorithm>
 #include <chrono>
 #include <limits>
 #include <stdexcept>
@@ -27,6 +28,19 @@ ContinuousScheduler::ContinuousScheduler(
 ContinuousScheduler::~ContinuousScheduler()
 {
     close();
+}
+
+size_t ContinuousScheduler::queuedCount() const
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    return mQueue.size();
+}
+
+size_t ContinuousScheduler::residentCount() const
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    return static_cast<size_t>(std::count_if(
+        mActive.begin(), mActive.end(), [](auto const& request) { return request != nullptr; }));
 }
 
 SchedulerTicket ContinuousScheduler::submit(std::vector<int32_t> const& prompt, int32_t maxOutput)

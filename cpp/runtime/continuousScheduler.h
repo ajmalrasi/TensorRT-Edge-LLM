@@ -162,6 +162,8 @@ public:
     SchedulerTicket submit(std::vector<int32_t> const& prompt, int32_t maxOutput);
     SchedulerTicket submit(std::vector<int32_t> const& prompt, SchedulerRequestOptions const& options);
     void close();
+    size_t queuedCount() const;
+    size_t residentCount() const;
     bool healthy() const
     {
         return mHealthy.load();
@@ -192,7 +194,7 @@ private:
     size_t const mMaxQueued;
     size_t const mMaxQueuedBytes;
     Observer mObserver;
-    std::mutex mMutex;
+    mutable std::mutex mMutex;
     std::mutex mCloseMutex;
     std::condition_variable mWake;
     std::deque<std::unique_ptr<Request>> mQueue;

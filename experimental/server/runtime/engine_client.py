@@ -190,7 +190,7 @@ def _capabilities_for(llm: Union[LLM, TTS]) -> EngineCapabilities:
             builder.get("max_input_len"), int) else None,
         max_batch_size=builder.get("max_batch_size") if isinstance(
             builder.get("max_batch_size"), int) else None,
-        max_num_seqs=1,
+        max_num_seqs=2 if getattr(llm, "continuous_batching_enabled", False) else 1,
         kv_cache_dtype=str(config.get("kv_cache_dtype", "unknown")),
         speculative_decoding=llm.has_draft_model,
         speculative_method=str(config.get("spec_decode_type", "none")),
@@ -280,10 +280,14 @@ class EngineClient:
 
     @property
     def active_requests(self) -> int:
+        if getattr(self._llm, "continuous_batching_enabled", False):
+            return int(self._llm._runtime.continuous_resident_requests())
         return self._admission.active
 
     @property
     def queued_requests(self) -> int:
+        if getattr(self._llm, "continuous_batching_enabled", False):
+            return int(self._llm._runtime.continuous_queued_requests())
         return self._admission.waiting
 
     async def close(self) -> None:
@@ -316,6 +320,18 @@ class EngineClient:
         tool_config: ToolConfig,
         enable_thinking: bool,
     ) -> int:
+        if getattr(self._llm, "continuous_batching_enabled", False):
+            request = await _run_sync(partial(
+                self._llm._make_generation_request, messages,
+                SamplingParams(max_tokens=1, enable_thinking=enable_thinking),
+                tools=tool_config.tools, tool_choice=tool_config.tool_choice,
+                tool_config=tool_config))
+            count = await _run_sync(partial(
+                self._llm._count_prepared_prompt_tokens, request))
+            if count is None:
+                raise UnsupportedFeatureError(
+                    "exact token counting is not available for media inputs")
+            return count
         prepared = await self.prepare_request(
             messages,
             SamplingParams(max_tokens=1, enable_thinking=enable_thinking),
@@ -351,6 +367,16 @@ class EngineClient:
             tool_config = tool_config or validate_tool_request(
                 messages, tools, tool_choice)
             if owned is None:
+                if getattr(self._llm, "continuous_batching_enabled", False):
+                    request = await _run_sync(partial(
+                        self._llm._make_generation_request,
+                        messages, sampling_params, tools=tool_config.tools,
+                        tool_choice=tool_config.tool_choice,
+                        tool_config=tool_config))
+                    return await _run_sync(partial(
+                        self._llm._complete_continuous_request, request,
+                        sampling_params, tool_config, tool_parser=tool_parser,
+                        reasoning_parser=reasoning_parser))
                 owned = await self.prepare_request(
                     messages,
                     sampling_params,
@@ -410,6 +436,26 @@ class EngineClient:
         prepared: Optional[PreparedRequest] = None,
     ) -> AsyncGenerator[StreamDelta, None]:
         iterator = None
+        if (prepared is None
+                and getattr(self._llm, "continuous_batching_enabled", False)):
+            try:
+                request = await _run_sync(partial(
+                    self._llm._make_generation_request, messages,
+                    sampling_params, tools=tools, tool_choice=tool_choice))
+                iterator = self._llm.generate_continuous_stream(
+                    request, sampling_params)
+                async for item in _iterate_sync(iterator):
+                    yield item
+                return
+            except (ServerError, KeyError, TypeError, ValueError):
+                raise
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise EngineError(str(exc)) from exc
+            finally:
+                if iterator is not None:
+                    await asyncio.to_thread(_close_stream, iterator)
         owned = prepared or await self.prepare_request(
             messages,
             sampling_params,
