@@ -6,6 +6,7 @@
 #include "common/bindingNames.h"
 #include "common/trtUtils.h"
 #include "kernels/posEncoding/initializeCosSinCache.h"
+#include "runtime/greedySchedulerBackend.h"
 #include "runtime/llmRankRuntime.h"
 #include "runtime/sequenceStepRuntime.h"
 
@@ -884,6 +885,98 @@ bool runChunkTests(LLMRankRuntime& runtime, tokenizer::Tokenizer& tokenizer, cud
     std::cout << "P3_QUALITY_GATE passed=" << passed << std::endl;
     return passed;
 }
+bool runSchedulerTests(LLMRankRuntime& runtime, tokenizer::Tokenizer& tokenizer, cudaStream_t stream)
+{
+    ContinuousBatchingProbe observer(runtime, stream);
+    auto const words = tokenizer.encode("A red fox crosses a blue river. One two three four. ");
+    auto prompt = [&](int32_t length) {
+        std::vector<int32_t> tokens;
+        for (int32_t i = 0; i < length; ++i)
+        {
+            tokens.push_back(words.at(i % words.size()));
+        }
+        return tokens;
+    };
+    auto const pa = prompt(65), pb = prompt(1025), pc = prompt(129);
+    std::vector<SchedulerEvent> events;
+    events.reserve(1024);
+    bool armed = false, submitted = false;
+    ContinuousScheduler* owner = nullptr;
+    SchedulerTicket b, c;
+    auto backend = std::make_unique<GreedySchedulerBackend>(runtime, stream, observer.vocabularySize());
+    ContinuousScheduler scheduler(std::move(backend), 8, 65536, [&](SchedulerEvent const& event) {
+        if (event.kind == SchedulerEvent::Kind::kIdle)
+        {
+            return;
+        }
+        events.push_back(event);
+        if (armed && !submitted && event.kind == SchedulerEvent::Kind::kDecode)
+        {
+            submitted = true;
+            b = owner->submit(pb, 12);
+            c = owner->submit(pc, 12);
+        }
+    });
+    owner = &scheduler;
+    auto result = [&](SchedulerTicket const& ticket) {
+        require(ticket.result().wait_for(std::chrono::seconds(60)) == std::future_status::ready, "Stranded ticket");
+        auto value = ticket.result().get();
+        require(value.status == SchedulerStatus::kCompleted, "Scheduler request failed");
+        return value.tokens;
+    };
+    auto const ra = result(scheduler.submit(pa, 6));
+    auto const rb = result(scheduler.submit(pb, 12));
+    auto const rc = result(scheduler.submit(pc, 12));
+    // Configure the diagnostic through submission's mutex happens-before boundary.
+    armed = true;
+    auto a = scheduler.submit(pa, 6);
+    auto const actualA = result(a);
+    auto const actualB = result(b);
+    auto const actualC = result(c);
+    scheduler.close();
+    bool const exact = actualA == ra && actualB == rb && actualC == rc;
+    SequenceHandle ah{}, ch{};
+    bool aReleased = false, reused = false, bContinued = false, pair = false, staggered = false;
+    for (auto const& e : events)
+    {
+        std::cout << "P4_EVENT kind=" << static_cast<int>(e.kind) << " request=" << e.request
+                  << " slot=" << e.handle.slot << " generation=" << e.handle.generation << " partner=" << e.partner
+                  << " cursor=" << e.cursor << " us=" << e.microseconds << std::endl;
+        if (e.request == a.id() && e.kind == SchedulerEvent::Kind::kAdmit)
+        {
+            ah = e.handle;
+        }
+        if (e.request == a.id() && e.kind == SchedulerEvent::Kind::kDecode)
+        {
+            staggered = true;
+        }
+        if (e.request == b.id() && e.kind == SchedulerEvent::Kind::kAdmit)
+        {
+            require(staggered, "B admitted before A decode");
+        }
+        if (e.request == a.id() && e.kind == SchedulerEvent::Kind::kRelease)
+        {
+            aReleased = true;
+        }
+        if (e.request == c.id() && e.kind == SchedulerEvent::Kind::kAdmit)
+        {
+            ch = e.handle;
+            reused = aReleased && ah.slot == ch.slot && ch.generation > ah.generation;
+        }
+        if (reused && e.request == b.id() && e.kind == SchedulerEvent::Kind::kPrefill)
+        {
+            bContinued = true;
+        }
+        if (e.partner && (e.request == b.id() || e.request == c.id()))
+        {
+            pair = true;
+        }
+    }
+    bool const passed = exact && reused && bContinued && pair && scheduler.healthy();
+    std::cout << "P4_SCHEDULER_GATE passed=" << passed << " exact_outputs=" << exact << " reused=" << reused
+              << " b_continued=" << bContinued << " paired_decode=" << pair << std::endl;
+    return passed;
+}
 } // namespace rt
 } // namespace trt_edgellm
 
@@ -891,10 +984,11 @@ int main(int argc, char** argv)
 {
     if (argc != 3
         && (argc != 4
-            || (std::string(argv[3]) != "--steps"
+            || (std::string(argv[3]) != "--scheduler" && std::string(argv[3]) != "--steps"
                 && (std::string(argv[3]) != "--chunks" && std::string(argv[3]) != "--chunks-extra"))))
     {
-        std::cerr << "Usage: continuous_batching_probe ENGINE_DIR CHECKPOINT_DIR [--steps|--chunks|--chunks-extra]\n";
+        std::cerr << "Usage: continuous_batching_probe ENGINE_DIR CHECKPOINT_DIR "
+                     "[--steps|--chunks|--chunks-extra|--scheduler]\n";
         return 2;
     }
     cudaStream_t stream{};
@@ -909,11 +1003,13 @@ int main(int argc, char** argv)
             trt_edgellm::rt::require(tokenizer.loadFromHF(argv[1], false), "Tokenizer loading failed");
             trt_edgellm::rt::LLMRankRuntime runtime(argv[1], "", {}, std::nullopt, stream,
                 trt_edgellm::rt::ParallelMapping{}, tokenizer, trt_edgellm::rt::ContextCacheConfig{}, argv[2], "");
-            passed = argc == 4 ? (std::string(argv[3]).find("--chunks") == 0
-                                         ? trt_edgellm::rt::runChunkTests(
-                                               runtime, tokenizer, stream, std::string(argv[3]) == "--chunks-extra")
-                                         : trt_edgellm::rt::runStepTests(runtime, tokenizer, stream))
-                               : trt_edgellm::rt::runProbe(runtime, tokenizer, stream);
+            passed = argc == 4 && std::string(argv[3]) == "--scheduler"
+                ? trt_edgellm::rt::runSchedulerTests(runtime, tokenizer, stream)
+                : argc == 4 ? (std::string(argv[3]).find("--chunks") == 0
+                                      ? trt_edgellm::rt::runChunkTests(
+                                            runtime, tokenizer, stream, std::string(argv[3]) == "--chunks-extra")
+                                      : trt_edgellm::rt::runStepTests(runtime, tokenizer, stream))
+                            : trt_edgellm::rt::runProbe(runtime, tokenizer, stream);
         }
         CUDA_CHECK(cudaStreamDestroy(stream));
         std::cout << "PROBE_RESULT passed=" << passed << std::endl;

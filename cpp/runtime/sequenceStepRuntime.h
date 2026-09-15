@@ -41,6 +41,8 @@ public:
     void finish(SequenceHandle handle);
     void release(SequenceHandle handle);
     bool healthy() const noexcept;
+    //! Retain the parent lease after an external sampling/worker failure. Recreate the parent to recover.
+    void poison() noexcept;
 
 private:
     struct Lease;

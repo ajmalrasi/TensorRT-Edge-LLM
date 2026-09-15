@@ -118,6 +118,11 @@ SequenceStepRuntime::~SequenceStepRuntime()
     }
 }
 
+void SequenceStepRuntime::poison() noexcept
+{
+    mLease->poisoned = true;
+}
+
 bool SequenceStepRuntime::healthy() const noexcept
 {
     return !mLease->poisoned;
